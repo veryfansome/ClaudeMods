@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""reflect-end: SessionEnd handler — record the ending session's transcript for the
+rumination pass (/memory-reflect).
+
+Synchronous + append-only, so the write lands before the process exits — an async hook
+doesn't wait, and SessionEnd IS process exit, so the append could be killed before it
+lands. Fast and tiny: it must finish inside SessionEnd's 1.5s default budget, which a
+plugin-provided hook cannot raise. Records EVERY end, including `reason: resume` (a
+switched-away-from session still carries the ending transcript; reflect-scan owns the
+resume/watermark nuance). Fail-soft: a malformed payload or an I/O hiccup is a silent
+exit 0 — plumbing never blocks or errors a session.
+
+These records are a precise, reason-bearing OPTIMIZATION for reflect-scan, not its only
+source: reflect-scan independently scans the transcript dir, so an end this hook misses
+(killed inside the budget) is still discovered and mined.
+"""
+import json
+import os
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STORE = os.path.join(HOME, ".claudemods", "shared-memory")
+ENDS = os.path.join(STORE, ".reflect", "ends.jsonl")
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0  # malformed payload → silent no-op
+    if not isinstance(payload, dict):
+        return 0  # well-formed but non-object JSON (a bare scalar/array) → silent no-op
+    tpath = payload.get("transcript_path")
+    if not tpath:
+        return 0
+    rec = {"transcript_path": tpath, "reason": payload.get("reason", ""), "ts": time.time()}
+    try:
+        os.makedirs(os.path.dirname(ENDS), exist_ok=True)
+        # O_APPEND: lock-free and append-safe; ends.jsonl is never rewritten
+        fd = os.open(ENDS, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (json.dumps(rec) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        return 0  # I/O hiccup → silent no-op
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

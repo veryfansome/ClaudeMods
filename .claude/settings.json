@@ -1,0 +1,5 @@
+{
+  "enabledPlugins": {
+    "shared-memory@claudemods": true
+  }
+}

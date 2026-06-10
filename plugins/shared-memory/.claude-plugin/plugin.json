@@ -1,0 +1,6 @@
+{
+  "name": "shared-memory",
+  "description": "A git-shareable store of distilled lessons for Claude Code: promote generalizable memories out of per-project auto-memory, guarded by shipped doctrine (evidence-graded, cold-reader-written, sign-off-gated)",
+  "version": "0.3.3",
+  "repository": "https://github.com/veryfansome/claudemods"
+}

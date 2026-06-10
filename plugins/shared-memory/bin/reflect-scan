@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""reflect-scan: the mining front of /memory-reflect. Owns the .reflect/ state and mines
+recent session transcripts for SALIENCE — moments a correction likely happened — emitting
+POINTERS (never excerpts) into the distill candidate queue for the reflect skill to read
+in full and, with sign-off, turn into memories.
+
+State (.reflect/):
+  ends.jsonl      append-only; reflect-end writes {transcript_path, reason, ts} per SessionEnd.
+  watermark.json  reflect-scan-owned; transcript_path -> {offset, final}. The offset is a
+                  0-BASED RECORD INDEX (the Nth JSON line), the same unit a pointer's
+                  <transcript-offset> uses, so the skill reads from record N and widens.
+
+Discovery is independent of the hook (the "copes without it" contract): it scans the
+transcript dir (~/.claude/projects/*/*.jsonl) UNION the ends.jsonl paths, and mines each
+transcript only PAST its per-path offset — keyed per path, so content appended to a
+*resumed* transcript is still picked up (a single global watermark would miss it). A
+recorded path swept by cleanupPeriodDays (default 30) is skipped and advanced, never an
+error.
+
+Pointer grammar — THE canonical definition; distill-scan's classifier shares the prefix:
+  reflect-pointer:<session-path>:<transcript-offset>:<marker>
+parsed by stripping the `reflect-pointer:` prefix then rsplit(':', 2) — <marker> (a
+controlled salience token, no ':') and <transcript-offset> (digits) come off the right,
+and <session-path> is the verbatim remainder (paths hold '/' and may hold ':').
+
+Salience markers (v1 — validated at design time against the local corpus; see m2.md §4).
+Each fires on ONE transcript channel; markers run only on GENUINE conversational content —
+task-notifications, <system-reminder>/<command-*> blocks, attachments, compaction
+summaries, and tool_result text are excluded, or the lexical markers drown in noise.
+"""
+import collections
+import glob
+import json
+import os
+import re
+import sys
+
+HOME = os.path.expanduser("~")
+STORE = os.path.join(HOME, ".claudemods", "shared-memory")
+REFLECT = os.path.join(STORE, ".reflect")
+ENDS = os.path.join(REFLECT, "ends.jsonl")
+WATERMARK = os.path.join(REFLECT, "watermark.json")
+QUEUE = os.path.join(STORE, ".candidates.log")
+TRANSCRIPT_GLOB = os.path.join(HOME, ".claude", "projects", "*", "*.jsonl")
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _apply_common as ac  # noqa: E402 — for repo/domain recovery in the M4 domain-miss audit
+
+POINTER_PREFIX = "reflect-pointer:"
+
+# --- salience markers (channel-scoped) ------------------------------------------------
+CONCESSION_RE = re.compile(
+    r"\b(you're right|you are right|you're correct|you are correct|my mistake|"
+    r"i was wrong|i overclaimed|i mis(?:read|understood|spoke)|good catch|"
+    r"i owe you a correction|i apologi)", re.I)
+INTERRUPT_MARKER = "[Request interrupted by user"
+# the canonical rejection tool_result — matched at the START (case-insensitive): a genuine
+# denial BEGINS with it, whereas tool OUTPUT that merely quotes the phrase (a grep/read of
+# this very design) does not, so startswith excludes that meta noise.
+PERMISSION_DECLINE = "the user doesn't want to proceed with this tool use"
+
+# a user string that is machine-injected, not a typed turn
+NONGENUINE_PREFIXES = ("<command-", "<local-command-", "<system-reminder", "<task-notification",
+                       "[SYSTEM NOTIFICATION", "caveat:")
+COMPACTION_MARKER = "This session is being continued from a previous conversation"
+
+
+def is_genuine_turn(text):
+    """True iff a user string is a real typed turn, not an injected block or a compaction
+    summary — the filter that keeps the lexical markers out of the noise."""
+    t = text.lstrip()
+    if not t:
+        return False
+    if t.lower().startswith(NONGENUINE_PREFIXES):
+        return False
+    if COMPACTION_MARKER in text[:200]:
+        return False
+    return True
+
+
+def make_pointer(path, offset, marker):
+    return f"{POINTER_PREFIX}{path}:{offset}:{marker}"
+
+
+def parse_pointer(line):
+    """The canonical inverse of make_pointer. None if the line is not a well-formed
+    pointer. Used by this script's own summary and by the round-trip test that pins the
+    grammar; the reflect skill reads a pointer by the same rule (strip prefix, rsplit)."""
+    if not line.startswith(POINTER_PREFIX):
+        return None
+    try:
+        path, offset, marker = line[len(POINTER_PREFIX):].rsplit(":", 2)
+    except ValueError:
+        return None
+    if not offset.isdigit():
+        return None
+    return {"session_path": path, "offset": int(offset), "marker": marker}
+
+
+def _tool_result_text(block):
+    tc = block.get("content")
+    if isinstance(tc, list):
+        return "".join(x.get("text", "") for x in tc if isinstance(x, dict))
+    return tc if isinstance(tc, str) else ""
+
+
+def mine(path, start):
+    """(record_count, hits) for a transcript, hits = [(offset, marker)] at record index
+    >= start. Streams one JSON line per record. Returns (None, []) if the file is gone or
+    unreadable (swept by cleanupPeriodDays). The consecutive-error run is tracked from the
+    file start so a run straddling the watermark is still correct, but only hits at or past
+    `start` are emitted (records below it were mined on an earlier pass)."""
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        return None, []
+    hits = []
+    tool_by_id = {}
+    err_tool, err_len = None, 0  # consecutive same-tool is_error run
+    n = -1
+    with f:
+        for n, raw in enumerate(f):
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(o, dict):
+                continue  # a bare scalar/array record — not a turn, don't crash on .get
+            t = o.get("type")
+            msg = o.get("message")
+            msg = msg if isinstance(msg, dict) else {}   # a truthy non-dict message (42/str/list)
+            content = msg.get("content")                  # would crash .get — guard like recover_cwd
+            below = n < start
+            if t == "assistant" and isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        tool_by_id[b.get("id")] = b.get("name", "")
+                if not below:
+                    text = " ".join(b.get("text", "") for b in content
+                                    if isinstance(b, dict) and b.get("type") == "text")
+                    if text and CONCESSION_RE.search(text):
+                        hits.append((n, "concession"))
+            elif t == "user":
+                # user text is a plain string OR a list carrying text blocks (a genuine
+                # interruption is recorded list-form, [{type:text, text:"[Request ..."}]),
+                # so check BOTH shapes for the marker on a genuine (non-injected) turn
+                texts = ([content] if isinstance(content, str)
+                         else [b.get("text", "") for b in content
+                               if isinstance(b, dict) and b.get("type") == "text"]
+                         if isinstance(content, list) else [])
+                if not below and any(is_genuine_turn(x) and x.lstrip().startswith(INTERRUPT_MARKER)
+                                     for x in texts):
+                    hits.append((n, "interruption"))
+                if isinstance(content, list):
+                    for b in content:
+                        if not (isinstance(b, dict) and b.get("type") == "tool_result"):
+                            continue
+                        text = _tool_result_text(b)
+                        tool = tool_by_id.get(b.get("tool_use_id"), "")
+                        is_denial = text.strip().lower().startswith(PERMISSION_DECLINE)
+                        if not below and is_denial:
+                            hits.append((n, "permission-decline"))
+                        # a denial is a user choice, not a technical failure, and an
+                        # unresolved tool name ('') is not a matchable identity — both break
+                        # the consecutive-same-tool run rather than extend or falsely match it
+                        if b.get("is_error") and not is_denial and tool:
+                            err_len = err_len + 1 if tool == err_tool else 1
+                            err_tool = tool
+                            if err_len == 2 and not below:  # the 2nd of a consecutive run
+                                hits.append((n, "repeated-tool-failure"))
+                        else:
+                            err_tool, err_len = None, 0
+    return n + 1, hits
+
+
+def load_watermark():
+    try:
+        return json.load(open(WATERMARK, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_watermark(wm):
+    os.makedirs(REFLECT, exist_ok=True)
+    tmp = WATERMARK + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(wm, f, indent=1, sort_keys=True)
+    os.replace(tmp, WATERMARK)
+
+
+def latest_reasons():
+    """transcript_path -> most-recent end reason, from the append-only ends.jsonl."""
+    reasons = {}
+    try:
+        for ln in open(ENDS, encoding="utf-8"):
+            try:
+                e = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(e, dict) and e.get("transcript_path"):
+                reasons[e["transcript_path"]] = e.get("reason", "")
+    except OSError:
+        pass
+    return reasons
+
+
+def append_pointers(pointers):
+    os.makedirs(STORE, exist_ok=True)
+    fd = os.open(QUEUE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, "".join(p + "\n" for p in pointers).encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def recover_cwd(path):
+    """The session's working directory, read from the transcript's early records (a `cwd` field
+    on a record or its message). None if unrecoverable. Feeds the M4 domain-miss audit: the skill
+    needs the session's repo to know which domain projections it did (not) load."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i > 40:
+                    break
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue  # a bare scalar/array line is valid JSON but not a record
+                msg = rec.get("message")
+                c = rec.get("cwd") or (msg.get("cwd") if isinstance(msg, dict) else None)
+                if c:
+                    return c
+    except OSError:
+        pass
+    return None
+
+
+def session_domains(cwd):
+    """The domains the session's repo was mapped to (so did-load), fail-soft to []. The skill
+    diffs this against a domain-scoped memory's `domains` to spot a domain-EXCLUDED memory that
+    was nonetheless relevant to the work — the M4 false-negative the flat index never had."""
+    if not cwd:
+        return []
+    try:
+        return ac.repo_domains(cwd)
+    except Exception:
+        return []
+
+
+def main():
+    reasons = latest_reasons()
+    wm = load_watermark()
+    transcripts = sorted(set(glob.glob(TRANSCRIPT_GLOB)) | set(reasons))
+    scanned, swept, pointers = [], [], []
+    for path in transcripts:
+        entry = wm.get(path, {})
+        if entry.get("final") and (reasons.get(path, "") != "resume" or not os.path.exists(path)):
+            continue  # terminally ended and fully mined — but a fresh 'resume' end re-opens the
+            # transcript so an appended tail past the offset still mines ([R9] D4: the stored
+            # `final` was previously honored before the current reason was read, silently dropping
+            # a correction added by resuming a terminally-ended session). The `not os.path.exists`
+            # conjunct settles a resume-reasoned transcript ONCE it is swept: ends.jsonl is
+            # append-only so its reason stays 'resume' forever — without it a swept resumed path
+            # would re-mine (→None→swept) and re-emit on every scan ([R9] D-2, caught in R9 review)
+        start = int(entry.get("offset", 0))
+        count, hits = mine(path, start)
+        if count is None:  # swept by cleanupPeriodDays / unreadable — advance, never error
+            if path in reasons:
+                swept.append(path)
+                wm[path] = {"offset": start, "final": True}
+            continue
+        if "\n" in path:
+            continue  # a path with an embedded newline would forge a second queue line
+        for off, marker in hits:
+            pointers.append(make_pointer(path, off, marker))
+        reason = reasons.get(path, "")
+        final = bool(reason) and reason != "resume"  # resume-ended stays mineable
+        wm[path] = {"offset": count, "final": final}
+        cwd = recover_cwd(path)
+        scanned.append({"path": path, "from_offset": start, "to_offset": count,
+                        "final": final, "hits": len(hits),
+                        "cwd": cwd, "domains": session_domains(cwd)})   # M4 domain-miss audit inputs
+    if pointers:
+        append_pointers(pointers)
+    save_watermark(wm)
+    by_marker = collections.Counter(parse_pointer(p)["marker"] for p in pointers)
+    print(json.dumps({
+        "scanned": scanned,
+        "swept": swept,
+        "pointers_emitted": len(pointers),
+        "by_marker": dict(by_marker),
+    }, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

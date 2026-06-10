@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""review-apply: the mechanical back of /memory-review.
+
+  review-apply --validate plan.json   # schema + guard checks; exit 0 iff clean
+  review-apply plan.json              # execute the MECHANICAL ops of a signed-off plan
+
+Scripts never author beliefs: a consolidation framework and any index-line ADDITIONS
+are written by the skill through the file tools. review-apply only RETIRES — archive,
+de-index, delete, ledger — and binds a consolidation retire to its signed-off framework.
+
+Retire ordering is crash-safe: archive (no-clobber) -> remove the index line(s) ->
+delete the file -> RETIRED.md line. De-indexing before deleting means no window where
+the file is gone but its line still loads; the archive stamp carries the full ledger
+payload (retired_from/retired_on/reason[/superseded_by]) so a kill mid-retire is
+reconstructable by review-scan's reconciliation pass.
+
+Plan shape (version 1):
+{
+  "version": 1,
+  "retire": [{"name": "<name>", "path": "<store-relative .md>", "sha256": "<hex>",
+              "remove_index_lines": [{"index": "MEMORY.md"|"MEMORY.local.md"|..., "lines": [...]}],
+              "reason": "<free text>", "archive_dest": "local/archive/<name>.md"}],
+  "consolidate": [{"framework": "<store-relative .md>", "framework_sha256": "<hex>",
+                   "supersedes": ["<name>", ...],
+                   "sources": [{"name","path","sha256","remove_index_lines":[...],"archive_dest"}]}]
+}
+"""
+import datetime
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _apply_common as ac  # noqa: E402  (sibling library module in bin/)
+
+HOME = os.path.expanduser("~")
+STORE = os.path.join(HOME, ".claudemods", "shared-memory")
+LOCK = os.path.join(STORE, ".distill.lock")   # one store lock, shared with distill-apply
+ARCHIVE_ROOT = os.path.join(STORE, "local", "archive")
+RETIRED = os.path.join(STORE, "RETIRED.md")
+
+
+def abs_store(rel):
+    return os.path.join(STORE, rel)
+
+
+def parse_list(v):
+    """Parse an inline frontmatter list value, e.g. supersedes: [a, b] -> ['a', 'b']."""
+    v = (v or "").strip()
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    return [x.strip().strip('"').strip("'") for x in v.split(",") if x.strip()]
+
+
+def _check_retire(where, r, errs):
+    path = abs_store(r.get("path", ""))
+    if not r.get("name") or not r.get("path") or not r.get("sha256"):
+        errs.append(f"{where}: name, path, sha256 required")
+    if not ac.resolved_under(path, STORE):
+        errs.append(f"{where}: path must resolve under the store")
+    elif ac.is_doctrine_file(path):
+        errs.append(f"{where}: cannot retire a doctrine file")
+    if not ac.resolved_under(abs_store(r.get("archive_dest", "")), ARCHIVE_ROOT):
+        errs.append(f"{where}: archive_dest must resolve under local/archive/")
+    for j, op in enumerate(r.get("remove_index_lines", [])):
+        ipath = abs_store(op.get("index", ""))
+        if not op.get("index") or not op.get("lines"):
+            errs.append(f"{where}.remove_index_lines[{j}]: index and lines required")
+        if not ac.resolved_under(ipath, STORE):
+            errs.append(f"{where}.remove_index_lines[{j}]: index must resolve under the store")
+        for ln in (op.get("lines") if isinstance(op.get("lines"), list) else []):
+            t = ac.index_line_target(ln, ipath)
+            if t and ac.is_doctrine_file(t):
+                errs.append(f"{where}.remove_index_lines[{j}]: cannot remove a doctrine memory's index line")
+
+
+def validate(plan):
+    errs = []
+    if plan.get("version") != 1:
+        errs.append("plan version must be 1")
+    for i, r in enumerate(plan.get("retire", [])):
+        _check_retire(f"retire[{i}]", r, errs)
+    for i, c in enumerate(plan.get("consolidate", [])):
+        if not c.get("framework") or not c.get("framework_sha256"):
+            errs.append(f"consolidate[{i}]: framework and framework_sha256 required")
+        if not ac.resolved_under(abs_store(c.get("framework", "")), STORE):
+            errs.append(f"consolidate[{i}]: framework must resolve under the store")
+        if not (isinstance(c.get("supersedes"), list) and c.get("supersedes")):
+            errs.append(f"consolidate[{i}]: supersedes must be a non-empty list")
+        for j, s in enumerate(c.get("sources", [])):
+            _check_retire(f"consolidate[{i}].sources[{j}]", s, errs)
+    return errs
+
+
+def ledger_has(name):
+    """True iff RETIRED.md already carries a line for this memory — a retire is ledgered
+    once, so a crash-retry never double-stamps."""
+    try:
+        txt = open(RETIRED, encoding="utf-8").read()
+    except OSError:
+        return False
+    return any(re.match(r"- " + re.escape(name) + r" · ", ln) for ln in txt.splitlines())
+
+
+def append_retired_line(name, date, reason, framework=None):
+    if ledger_has(name):
+        return  # idempotent: already ledgered on an earlier (possibly crashed) run
+    line = f"- {name} · {date} · {reason}"
+    if framework:
+        line += f" · superseded by {framework}"
+    os.makedirs(STORE, exist_ok=True)
+    with open(RETIRED, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def archived_stamp(dest, name):
+    """If the archive dest already holds THIS retire in progress (its frontmatter's
+    retired_from == name), return the stamp fields — recovery reads the committed stamp
+    instead of re-deriving. None if the archive is absent or belongs to another memory."""
+    try:
+        fields, _ = ac.parse_frontmatter(open(dest, encoding="utf-8").read())
+    except OSError:
+        return None
+    return fields if (fields or {}).get("retired_from") == name else None
+
+
+def still_referenced(path):
+    """True iff a FLAT index (MEMORY.md / MEMORY.local.md) still has a line whose link resolves to
+    `path`. AUTHORITATIVE ([15]): globs the live flat indexes rather than trusting the plan's
+    index_ops, so a plan that FORGOT to de-index a flat memory can't strand a still-loading
+    MEMORY.md line by deleting the body. Projection indexes (MEMORY.<domain>.md) are deliberately
+    EXCLUDED — a domain memory's only reference is its generated projection line (cleaned up by the
+    post-retire gen-projections); including them would wrongly block every legit domain retire,
+    whose plan de-indexes no flat line."""
+    target = os.path.realpath(path)
+    for base in ("MEMORY.md", "MEMORY.local.md"):
+        ipath = os.path.join(STORE, base)
+        if not os.path.exists(ipath):
+            continue
+        try:
+            itext = open(ipath, encoding="utf-8").read()
+        except (OSError, UnicodeError):
+            return True   # present but unreadable → fail CLOSED: can't rule out a live line, block the delete
+        for ln in itext.splitlines():
+            t = ac.index_line_target(ln, ipath)
+            if t and os.path.realpath(t) == target:
+                return True
+    return False
+
+
+def deindex(index_path, lines):
+    """Idempotent verbatim-line drop: re-read the index fresh, remove any of `lines`
+    present, write once. Re-reading fresh lets batched retires de-index a shared
+    MEMORY.md in turn; dropping only present lines makes a crash-retry a no-op."""
+    try:
+        itext = open(index_path, encoding="utf-8").read()
+    except OSError:
+        return  # index gone/unreadable: nothing to de-index (already done, or never there)
+    drop = set(lines)
+    kept = [l for l in itext.splitlines() if l not in drop]
+    if len(kept) != len(itext.splitlines()):
+        # [R9] D2: atomic — a crash mid-rewrite must not truncate a committed store index and
+        # strand every OTHER memory's line (they'd silently stop @import-loading)
+        ac.atomic_write(index_path, "\n".join(kept) + ("\n" if itext.endswith("\n") else ""))
+
+
+def do_retire(r, date, framework, applied, skipped):
+    """Crash-safe retire: archive (no-clobber) -> de-index each containing index (before
+    the delete, so no window where the file is gone but its line still loads) -> delete
+    -> RETIRED.md line.
+
+    The archive is the commit point: once it carries the stamp, the retire is decided and
+    the rest is idempotent completion. So on a re-run where the archive already holds this
+    retire's stamp, we READ the ledger payload (retired_on/reason/superseded_by) back from
+    it rather than re-deriving today's date and re-CAS'ing the (possibly already-deleted)
+    source — that is what lets a kill at any boundary, on any later day, complete on replay."""
+    path = abs_store(r["path"])
+    dest = abs_store(r["archive_dest"])
+    index_ops = r.get("remove_index_lines", [])
+    prior = archived_stamp(dest, r["name"])
+    if prior is None:
+        # 1. fresh retire: CAS the live source, then archive it (no-clobber, idempotent)
+        text, err = ac.cas_read(path, r["sha256"])
+        if err:
+            skipped.append({"retire": r["name"], "reason": err})
+            return
+        stamp = {"retired_from": r["name"], "retired_on": date, "reason": r.get("reason", "")}
+        if framework:
+            stamp["superseded_by"] = framework
+        aerr = ac.archive_write(dest, ac.stamp_frontmatter(text, stamp))
+        if aerr:
+            skipped.append({"retire": r["name"], "reason": aerr})
+            return
+        led_date, led_reason, led_fw = date, stamp["reason"], framework
+    else:
+        # recovery: reconstruct the ledger payload from the committed stamp
+        led_date = prior.get("retired_on", date)
+        led_reason = prior.get("reason", r.get("reason", ""))
+        led_fw = prior.get("superseded_by", framework)
+        # if the source is back on disk it must still be the content we archived — a
+        # recreated/edited same-name file is not ours to delete on a stale replay
+        if os.path.exists(path):
+            _, err = ac.cas_read(path, r["sha256"])
+            if err:
+                skipped.append({"retire": r["name"],
+                                "reason": f"source present but {err}; not deleting on recovery"})
+                return
+    # 2. de-index each containing index (before delete)
+    for op in index_ops:
+        deindex(abs_store(op["index"]), op["lines"])
+    # guard: never delete while an index line still links here (a plan line that didn't
+    # match de-indexed nothing) — that would strand a still-loading reference
+    if still_referenced(path):
+        skipped.append({"retire": r["name"],
+                        "reason": "a flat index still references the body after de-index "
+                                  "(a plan line did not match, or a containing flat index was "
+                                  "omitted from the plan); not deleting"})
+        return
+    # 3. delete the source file
+    if os.path.exists(path):
+        os.remove(path)
+    # 4. append the RETIRED.md ledger line (idempotent)
+    append_retired_line(r["name"], led_date, led_reason, led_fw)
+    applied.append({"retired": r["name"], "archived_to": r["archive_dest"]})
+
+
+def apply(plan):
+    applied, skipped = [], []
+    try:
+        fd = ac.acquire_lock(LOCK)
+    except ac.LockHeld:
+        print(json.dumps({"error": f"lockfile exists: {LOCK} — another batch in flight?"}))
+        return 2
+    try:
+        date = datetime.date.today().isoformat()
+        for r in plan.get("retire", []):
+            do_retire(r, date, None, applied, skipped)
+        for c in plan.get("consolidate", []):
+            fpath = abs_store(c["framework"])
+            ftext, ferr = ac.cas_read(fpath, c["framework_sha256"])
+            if ferr:  # framework edited/swapped/absent since sign-off — no framework, no retire
+                skipped.append({"consolidate": c["framework"], "reason": f"framework {ferr}"})
+                continue
+            ffields, _ = ac.parse_frontmatter(ftext)
+            fname = (ffields or {}).get("name") or os.path.splitext(os.path.basename(fpath))[0].replace("_", "-")
+            supersedes = parse_list((ffields or {}).get("supersedes", ""))
+            for s in c.get("sources", []):
+                if s["name"] not in supersedes:  # existence never licenses a retire
+                    skipped.append({"consolidate": c["framework"], "source": s["name"],
+                                    "reason": "source not named in the framework's supersedes"})
+                    continue
+                do_retire(s, date, fname, applied, skipped)
+        print(json.dumps({"applied": applied, "skipped": skipped}, indent=1))
+        return 0 if not skipped else 3  # 3 = partial: skipped items reported
+    finally:
+        ac.release_lock(fd, LOCK)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if args[0] == "--validate":
+        errs = validate(json.load(open(args[1])))
+        print(json.dumps({"valid": not errs, "errors": errs}, indent=1))
+        return 0 if not errs else 1
+    plan = json.load(open(args[0]))
+    errs = validate(plan)
+    if errs:
+        print(json.dumps({"error": "plan failed validation; not applied", "errors": errs}, indent=1))
+        return 1
+    return apply(plan)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

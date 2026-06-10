@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""distill-apply: the mechanical back of /memory-distill.
+
+  distill-apply --validate plan.json   # schema + content checks; exit 0 iff clean
+  distill-apply plan.json              # execute the MECHANICAL ops of a signed-off plan
+
+Scripts never author beliefs: the plan's `beliefs` section is validated here but
+written by the skill through the file tools (diff-prompted). Apply executes only
+archives, source ops, and queue consumed-recording — each source compare-and-swapped
+against its scan-time hash; anything edited since scan is skipped and reported;
+deletions only after their archive copies land; all under a lockfile.
+
+Plan shape (version 1):
+{
+  "version": 1,
+  "beliefs":   [{"target": "<abs .md under the store>", "index": "MEMORY.md"|"MEMORY.local.md",
+                 "index_line": "- [Title](file.md) — <description>", "content": "<full file text>"}],
+  "archives":  [{"source": "<abs path>", "source_sha256": "<hex>",
+                 "dest": "<store-relative under local/archive/>", "promoted_to": "<name>"}],
+  "source_ops":[{"op": "delete"|"slim"|"remove_index_lines", "path": "<abs path>",
+                 "sha256": "<hex>", "slim_content"?: "...", "lines"?: ["<exact index line>", ...]}],
+  "queue_remove": [<int queue-line offset>, ...]   // consumed occurrences, appended to .candidates.consumed
+}
+"""
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _apply_common as ac  # noqa: E402  (sibling library module in bin/)
+
+HOME = os.path.expanduser("~")
+STORE = os.path.join(HOME, ".claudemods", "shared-memory")
+LOCK = os.path.join(STORE, ".distill.lock")
+ARCHIVE_ROOT = os.path.join(STORE, "local", "archive")
+TYPES = {"feedback", "reference", "framework"}
+BASES = {"verified", "observed", "contradicted"}
+
+sha, parse_frontmatter, cas_read = ac.sha, ac.parse_frontmatter, ac.cas_read
+
+
+def validate(plan):
+    errs = []
+    if plan.get("version") != 1:
+        errs.append("plan version must be 1")
+    for i, b in enumerate(plan.get("beliefs", [])):
+        where = f"beliefs[{i}]"
+        target, content = b.get("target", ""), b.get("content", "")
+        if not ac.resolved_under(target, STORE) or not target.endswith(".md"):
+            # resolve-then-verify (not a raw startswith) so a `../` traversal target can't pass ([5])
+            errs.append(f"{where}: target must be a .md under the store")
+        if ac.is_doctrine_file(target):  # store defends its own doctrine; on-disk read, fail-closed on a bad byte ([17])
+            errs.append(f"{where}: target declares doctrine: true — out of distill's scope; propose a doctrine revision instead")
+        fields, _ = parse_frontmatter(content)
+        if fields is None:
+            errs.append(f"{where}: content has no frontmatter block")
+            continue
+        if fields.get("doctrine") == "true":
+            errs.append(f"{where}: plans never mint doctrine — doctrine changes by deliberate revision")
+        name, desc = fields.get("name", ""), fields.get("description", "")
+        title = fields.get("title", "")
+        domains = [x.strip().strip('"').strip("'") for x in
+                   fields.get("domains", "").strip().lstrip("[").rstrip("]").split(",") if x.strip()]
+        if not name or not desc:
+            errs.append(f"{where}: name and description are required")
+        if fields.get("type") not in TYPES:
+            errs.append(f"{where}: type must be one of {sorted(TYPES)}")
+        if fields.get("type") == "framework" and not fields.get("applies_when"):
+            errs.append(f"{where}: frameworks carry applies_when")
+        if fields.get("basis") not in BASES:
+            errs.append(f"{where}: basis must be one of {sorted(BASES)}")
+        if fields.get("basis") == "verified" and "**Verified:**" not in content:
+            errs.append(f"{where}: verified entries document their check in **Verified:**")
+        if fields.get("last_verified") == "n/a":
+            errs.append(f"{where}: last_verified n/a is doctrine-only; plan beliefs carry dates")
+        stem = os.path.splitext(os.path.basename(target))[0].replace("_", "-")
+        if name != stem:
+            errs.append(f"{where}: name '{name}' must mirror filename '{stem}'")
+        if domains:
+            # a domain-tagged belief has NO flat index line — its line is a generated projection
+            # (gen-projections renders it from the body), so it needs `title` and must not carry
+            # a flat index/index_line for the belief channel to write.
+            if not title:
+                errs.append(f"{where}: a domain-tagged belief needs `title` (its projection line renders from the body)")
+            if b.get("index") or b.get("index_line"):
+                errs.append(f"{where}: a domain-tagged belief carries no flat index line — drop index/index_line (the generator renders its projection; run gen-projections after)")
+        else:
+            if b.get("index") not in ("MEMORY.md", "MEMORY.local.md"):
+                errs.append(f"{where}: index must be MEMORY.md or MEMORY.local.md")
+            # resolve-then-verify, not a raw substring ([5] sibling): a HOME containing "/local/"
+            # (e.g. /Users/local/alice) or a "local/../" path would misclassify with `in target`
+            if ac.resolved_under(target, os.path.join(STORE, "local")) != (b.get("index") == "MEMORY.local.md"):
+                errs.append(f"{where}: location and index disagree (local/ <=> MEMORY.local.md)")
+            if desc and desc not in b.get("index_line", ""):
+                errs.append(f"{where}: index_line must carry the description verbatim")
+    roots = ac.project_memory_roots(HOME)
+    for i, a in enumerate(plan.get("archives", [])):
+        if not a.get("source") or not a.get("source_sha256") or not a.get("promoted_to"):
+            errs.append(f"archives[{i}]: source, source_sha256, promoted_to required")
+        elif not ac.any_root(a["source"], roots):
+            errs.append(f"archives[{i}]: source not under an allowed project-memory root")
+        elif ac.is_doctrine_file(a["source"]):
+            errs.append(f"archives[{i}]: cannot archive a doctrine file")
+        if not ac.resolved_under(os.path.join(STORE, a.get("dest", "")), ARCHIVE_ROOT):
+            errs.append(f"archives[{i}]: dest must resolve under local/archive/")
+    for i, op in enumerate(plan.get("source_ops", [])):
+        kind, path = op.get("op"), op.get("path", "")
+        if kind not in ("delete", "slim", "remove_index_lines"):
+            errs.append(f"source_ops[{i}]: unknown op")
+        if not path or not op.get("sha256"):
+            errs.append(f"source_ops[{i}]: path and sha256 required")
+        if kind == "slim" and "slim_content" not in op:
+            errs.append(f"source_ops[{i}]: slim requires slim_content")
+        if kind == "remove_index_lines":
+            if not (isinstance(op.get("lines"), list) and op.get("lines")):
+                errs.append(f"source_ops[{i}]: remove_index_lines requires a non-empty lines list")
+            if os.path.basename(path) != "MEMORY.md":
+                errs.append(f"source_ops[{i}]: remove_index_lines must target a project MEMORY.md")
+            if path and not ac.any_root(path, roots):
+                errs.append(f"source_ops[{i}]: index path not under an allowed project-memory root")
+            for ln in (op.get("lines") if isinstance(op.get("lines"), list) else []):
+                t = ac.index_line_target(ln, path)
+                if t and ac.is_doctrine_file(t):
+                    errs.append(f"source_ops[{i}]: cannot remove a doctrine memory's index line")
+        else:  # delete / slim
+            if path and not ac.any_root(path, roots):
+                errs.append(f"source_ops[{i}]: path not under an allowed project-memory root")
+            if ac.is_doctrine_file(path):
+                errs.append(f"source_ops[{i}]: cannot delete or slim a doctrine file")
+            # M1: every consumed source is archived before it is removed — a delete/slim with no
+            # matching archives entry would destroy the source with no backup, so require one.
+            if path and not any(a.get("source") == path for a in plan.get("archives", [])):
+                errs.append(f"source_ops[{i}]: {kind} requires a matching archives entry (source must be archived before removal)")
+    qr = plan.get("queue_remove")
+    if qr is not None and not (isinstance(qr, list) and all(isinstance(o, int) for o in qr)):
+        errs.append("queue_remove must be a list of integer queue-line offsets")
+    return errs
+
+
+def apply(plan):
+    applied, skipped = [], []
+    try:
+        fd = ac.acquire_lock(LOCK)
+    except ac.LockHeld:
+        print(json.dumps({"error": f"lockfile exists: {LOCK} — another batch in flight?"}))
+        return 2
+    try:
+        archived_sources = set()
+        for a in plan.get("archives", []):
+            text, err = cas_read(a["source"], a["source_sha256"])
+            if err:
+                skipped.append({"archive": a["source"], "reason": err})
+                continue
+            dest = os.path.join(STORE, a["dest"])
+            stamped = ac.stamp_frontmatter(text, {"promoted_to": a["promoted_to"]})
+            aerr = ac.archive_write(dest, stamped)  # no-clobber + idempotent
+            if aerr:
+                skipped.append({"archive": a["source"], "reason": aerr})
+                continue
+            archived_sources.add(a["source"])
+            applied.append({"archived": a["source"], "to": a["dest"]})
+        for op in plan.get("source_ops", []):  # deletions only after archives landed
+            path = op["path"]
+            # M1: skip ANY delete/slim whose archive did not land (no archive entry, or it was
+            # skipped) — never destroy a source without a backup on disk.
+            if op["op"] in ("delete", "slim") and path not in archived_sources:
+                skipped.append({"op": op["op"], "path": path, "reason": "no archive landed for this source — skipped"})
+                continue
+            text, err = cas_read(path, op["sha256"])
+            if err:
+                skipped.append({"op": op["op"], "path": path, "reason": err})
+                continue
+            if op["op"] == "delete":
+                os.remove(path)
+            elif op["op"] == "slim":
+                ac.atomic_write(path, op["slim_content"])  # [R9] D3: crash mustn't truncate the body
+            elif op["op"] == "remove_index_lines":
+                # one op per index file: read once (CAS above), drop every line, write once —
+                # so batched removals from the same MEMORY.md never drift its hash mid-run
+                new_text, missing = ac.drop_index_lines(text, op["lines"])
+                if missing:  # CAS passed, so the file matches scan — a named line absent is a
+                    skipped.append({"op": op["op"], "path": path,  # malformed plan, not the race
+                                    "reason": "plan named index lines absent from the file — rebuild the plan, not a race",
+                                    "lines": missing})
+                    continue  # all-or-nothing: skip the whole op, don't partial-write
+                ac.atomic_write(path, new_text)  # [R9] D3: crash mustn't truncate a project index
+            applied.append({op["op"]: path})
+        # consumed-recording: append the offsets to .candidates.consumed under the lock,
+        # NEVER rewriting the append-only .candidates.log (a rewrite would clobber a concurrent
+        # capture/reflect O_APPEND). Idempotent: an already-consumed offset is skipped, so a
+        # crash-retry or partial-exit-3 re-run neither double-records nor errors.
+        remove = plan.get("queue_remove", [])
+        if remove:
+            consumed_path = os.path.join(STORE, ".candidates.consumed")
+            already = set()
+            if os.path.exists(consumed_path):
+                for ln in open(consumed_path, encoding="utf-8"):
+                    ln = ln.strip()
+                    if ln.isdigit():
+                        already.add(int(ln))
+            fresh = sorted({o for o in remove if isinstance(o, int)} - already)
+            if fresh:
+                with open(consumed_path, "a", encoding="utf-8") as f:
+                    f.write("".join(f"{o}\n" for o in fresh))
+            applied.append({"queue_consumed": len(fresh)})
+        print(json.dumps({"applied": applied, "skipped": skipped}, indent=1))
+        return 0 if not skipped else 3  # 3 = partial: skipped items reported for re-queue
+    finally:
+        ac.release_lock(fd, LOCK)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if args[0] == "--validate":
+        plan = json.load(open(args[1]))
+        errs = validate(plan)
+        print(json.dumps({"valid": not errs, "errors": errs}, indent=1))
+        return 0 if not errs else 1
+    plan = json.load(open(args[0]))
+    errs = validate(plan)
+    if errs:
+        print(json.dumps({"error": "plan failed validation; not applied", "errors": errs}, indent=1))
+        return 1
+    return apply(plan)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+{
+  "name": "claudemods",
+  "owner": { "name": "veryfansome" },
+  "plugins": [
+    {
+      "name": "shared-memory",
+      "source": "./plugins/shared-memory",
+      "description": "Shared memory store tooling: distill, doctrine, and (coming) capture/review/reflect"
+    }
+  ]
+}
