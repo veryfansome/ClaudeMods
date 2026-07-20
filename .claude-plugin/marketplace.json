@@ -3,6 +3,11 @@
   "owner": { "name": "veryfansome" },
   "plugins": [
     {
+      "name": "evolve",
+      "source": "./plugins/evolve",
+      "description": "ShinkaEvolve-inspired evolutionary search for any project: inventor agents mutate a marked region or chunk registry, a deterministic engine owns selection — archive, weighted sampling, dedup, pristine-clone scoring, noise-floored promotion, holdout firewall"
+    },
+    {
       "name": "shared-memory",
       "source": "./plugins/shared-memory",
       "description": "Distills generalizable lessons from per-project auto-memory into a git-shareable store: distill, review, reflect, capture + post-write eval, domain-scoped recall, and shipped doctrine"

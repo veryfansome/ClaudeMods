@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""evolve — deterministic backend CLI for the evolve plugin's search loop.
+
+The skills (/evolve:init, /evolve:round, /evolve:status) converse and orchestrate
+inventors; this CLI decides. Verbs:
+
+  init            scaffold evolve/ into the project (idempotent)
+  doctor          contract health pass; --measure-noise writes the measured floor
+  seed            score + archive the unmodified baseline as gen 0
+  sample          parent + operator + inspirations per inventor slot (budget-enforced)
+  brief           the full inventor brief context for one slot (markdown)
+  guard           validate a candidate (worktree or genome) without scoring
+  score           guard -> dedup -> pristine-clone eval -> record
+  rescore         re-run an archived candidate under a new mode/split, reusing its id
+                  (proxy->full promotion, paired champion rerun, final-split validation)
+  ingest          append an externally-scored result (tag --env; scores only compare
+                  within one environment)
+  board           leaderboard + budget + neutral per-inventor/operator stats
+  impls           list registered impls for a registry axis
+  adopt           apply an archived candidate to the working tree (markers mode)
+
+Exit codes: 0 ok · 1 error · 2 doctor/config failure · 3 budget exhausted ·
+4 guard violation · 5 novelty rejection · 6 infrastructure failure (export/setup — NOT
+archived, retry). 4/5 are Reflexion feedback (re-brief the inventor, don't archive)."""
+
+import argparse
+import json
+import pathlib
+import random
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from _evolve import archive, board, brief, config as cfgmod, doctor, runner, scaffold, score, surface  # noqa: E402
+
+
+def find_root(explicit):
+    if explicit:
+        return pathlib.Path(explicit).resolve()
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if r.returncode == 0:
+        return pathlib.Path(r.stdout.strip())
+    return pathlib.Path.cwd()
+
+
+def _fail(msg, code=1):
+    print(json.dumps({"error": msg}), file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _meta(args):
+    return {"id": args.id, "parent": args.parent, "inventor": args.inventor,
+            "operator": args.operator, "axis_changed": getattr(args, "axis_changed", None),
+            "rationale": args.rationale}
+
+
+def _check_split(cfg, split):
+    allowed = set(cfg["eval"]["splits"]) | {cfgmod.FINAL_SPLIT}
+    if split not in allowed:
+        _fail(f"unknown --split {split!r}; declared splits are {sorted(allowed)} "
+              f"(a typo'd split silently defeats the holdout firewall)", code=2)
+
+
+def cmd_init(root, args):
+    print(json.dumps(scaffold.init(root, mode=args.mode), indent=1))
+
+
+def cmd_doctor(root, args):
+    res = doctor.run(root, run_eval=args.run_eval, measure_noise=args.measure_noise, dry=args.dry)
+    print(json.dumps(res, indent=1))
+    raise SystemExit(0 if res["ok"] else 2)
+
+
+def cmd_seed(root, args):
+    cfg = cfgmod.load(root)
+    _check_split(cfg, args.split)
+    rec = score.score_seed(root, cfg, mode=args.mode, split=args.split, env=args.env,
+                           seed_id=args.id, no_archive=args.no_archive)
+    print(json.dumps(rec, indent=1))
+
+
+def cmd_sample(root, args):
+    cfg = cfgmod.load(root)
+    sel_env = cfg["fitness"].get("selection_env")
+    state = archive.budget_state(root, cfg["budget"], sel_env)
+    if state["exhausted"]:
+        print(json.dumps({"budget": state}), file=sys.stderr)
+        _fail("budget exhausted: " + "; ".join(state["exhausted"]), code=3)
+    probs = cfg["search"]["op_probs"]
+    axes = sorted(cfg["surface"]["registry"]["axes"]) if cfg["surface"]["mode"] == "registry" else []
+    valid_ids = [r["id"] for r in archive.leaderboard(root, 50, sel_env)]
+    slots = []
+    for i in range(args.k):
+        slot_seed = f"{args.seed}:{i}"
+        parent = archive.sample_parent(root, seed=slot_seed, lam=cfg["search"]["lambda"],
+                                       selection_env=sel_env)
+        ops, weights = zip(*probs.items())
+        op = random.Random(f"op:{slot_seed}").choices(ops, weights=weights, k=1)[0]
+        cross_with = None
+        if op == "cross":
+            partners = [i_ for i_ in valid_ids if not parent or i_ != parent["id"]]
+            if partners:
+                cross_with = random.Random(f"cross:{slot_seed}").choice(partners)
+            else:
+                op = "diff"  # nothing to cross with yet
+        insp = archive.sample_inspirations(root, parent["id"] if parent else None,
+                                           n_top=cfg["search"]["inspirations"]["top_k"],
+                                           n_archive=cfg["search"]["inspirations"]["archive"],
+                                           seed=slot_seed, selection_env=sel_env)
+        slot = {"slot": i, "parent": parent["id"] if parent else None,
+                "parent_fitness": parent["fitness"] if parent else None,
+                "operator": op, "cross_with": cross_with,
+                "inspirations": [r["id"] for r in insp], "seed": slot_seed}
+        if axes:  # registry: pick which axis this slot mutates (round-robins across axes)
+            slot["axis"] = axes[i % len(axes)]
+        slots.append(slot)
+    print(json.dumps({"slots": slots, "budget": state}, indent=1))
+
+
+def cmd_brief(root, args):
+    cfg = cfgmod.load(root)
+    print(brief.build(root, cfg, operator=args.operator, parent_id=args.parent,
+                      axis=args.axis, cross_with=args.cross_with, seed=args.seed))
+
+
+def cmd_guard(root, args):
+    cfg = cfgmod.load(root)
+    if args.candidate:
+        report = surface.guard_markers(args.candidate, cfg)
+    elif args.genome:
+        genome = json.loads(pathlib.Path(args.genome).read_text())
+        report = surface.guard_registry(genome, root, cfg)
+    else:
+        _fail("guard needs --candidate <worktree> or --genome <file>")
+    print(json.dumps(report, indent=1))
+    raise SystemExit(0 if report["ok"] else 4)
+
+
+def cmd_score(root, args):
+    cfg = cfgmod.load(root)
+    _check_split(cfg, args.split)
+    kwargs = {}
+    if args.candidate:
+        kwargs["worktree"] = args.candidate
+    if args.patch:
+        kwargs["patch"] = pathlib.Path(args.patch).read_text()
+    if args.genome:
+        kwargs["genome"] = json.loads(pathlib.Path(args.genome).read_text())
+    if len(kwargs) != 1:
+        _fail("score needs exactly one of --candidate | --patch | --genome")
+    rec = score.score_candidate(root, cfg, mode=args.mode, split=args.split,   # Rejection -> main (exit 4/5)
+                                meta=_meta(args), force=args.force, env=args.env,
+                                no_archive=args.no_archive, **kwargs)
+    print(json.dumps(rec, indent=1))
+
+
+def cmd_rescore(root, args):
+    cfg = cfgmod.load(root)
+    _check_split(cfg, args.split)
+    rec = score.rescore(root, cfg, rec_id=args.id, mode=args.mode, split=args.split, env=args.env)
+    print(json.dumps(rec, indent=1))
+
+
+def cmd_ingest(root, args):
+    cfg = cfgmod.load(root)
+    _check_split(cfg, args.split)
+    genome = json.loads(pathlib.Path(args.genome).read_text()) if args.genome else None
+    rec = score.ingest(root, cfg, result_text=pathlib.Path(args.result).read_text(),
+                       meta=_meta(args), mode=args.mode, split=args.split, env=args.env,
+                       genome=genome)
+    print(json.dumps({k: rec.get(k) for k in ("id", "fitness", "guardrail", "mode", "split", "env")},
+                     indent=1))
+
+
+def cmd_board(root, args):
+    cfg = cfgmod.load(root)
+    rep = board.report(root, cfg, top=args.top)
+    print(json.dumps(rep, indent=1) if args.json else board.render(rep))
+
+
+def cmd_impls(root, args):
+    cfg = cfgmod.load(root)
+    if cfg["surface"]["mode"] != "registry":
+        _fail("impls applies to registry-mode projects")
+    axes = [args.axis] if args.axis else sorted(cfg["surface"]["registry"]["axes"])
+    print(json.dumps({a: surface.list_impls(root, cfg, a) for a in axes}, indent=1))
+
+
+def cmd_adopt(root, args):
+    cfg = cfgmod.load(root)
+    recs = [r for r in archive.load(root) if r["id"] == args.id]
+    if not recs:
+        _fail(f"no archived record with id {args.id!r}")
+    rec = recs[-1]
+    if isinstance(rec.get("genome"), dict):
+        print(json.dumps({"id": args.id, "genome": rec["genome"],
+                          "note": "registry adoption = use this genome as the shipped recipe"}, indent=1))
+        return
+    rel = (rec.get("surface") or {}).get("patch")
+    if not rel:
+        _fail(f"record {args.id!r} carries no patch (was it the seed?)")
+    patch = (cfgmod.state_dir(root) / rel).read_text()
+    r = subprocess.run(["git", "apply", "--whitespace=nowarn"], input=patch, text=True,
+                       capture_output=True, cwd=root)
+    if r.returncode != 0:
+        _fail(f"patch no longer applies to the working tree: {r.stderr.strip()}")
+    print(json.dumps({"adopted": args.id, "applied": rel,
+                      "note": "review + commit the change like any other diff"}, indent=1))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="evolve", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=None, help="project root (default: git toplevel of cwd)")
+    sub = ap.add_subparsers(required=True, dest="verb")
+
+    def add_mode_split(p):
+        p.add_argument("--mode", default="proxy", choices=["proxy", "full"])
+        p.add_argument("--split", default=cfgmod.DEFAULT_SPLIT)
+        p.add_argument("--env", default=None)
+
+    def add_meta(p):
+        p.add_argument("--id", required=True)
+        p.add_argument("--parent", default=None)
+        p.add_argument("--inventor", default=None)
+        p.add_argument("--operator", default=None)
+        p.add_argument("--axis-changed", dest="axis_changed", default=None)
+        p.add_argument("--rationale", default=None)
+
+    p = sub.add_parser("init"); p.add_argument("--mode", default="markers", choices=["markers", "registry"]); p.set_defaults(fn=cmd_init)
+    p = sub.add_parser("doctor"); p.add_argument("--run-eval", action="store_true")
+    p.add_argument("--measure-noise", action="store_true"); p.add_argument("--dry", action="store_true"); p.set_defaults(fn=cmd_doctor)
+    p = sub.add_parser("seed"); add_mode_split(p); p.add_argument("--id", default="gen0-baseline")
+    p.add_argument("--no-archive", action="store_true"); p.set_defaults(fn=cmd_seed)
+    p = sub.add_parser("sample"); p.add_argument("--k", type=int, default=3); p.add_argument("--seed", default="0"); p.set_defaults(fn=cmd_sample)
+    p = sub.add_parser("brief"); p.add_argument("--operator", default="diff", choices=list(cfgmod.OPERATORS))
+    p.add_argument("--parent", default=None); p.add_argument("--axis", default=None)
+    p.add_argument("--cross-with", dest="cross_with", default=None); p.add_argument("--seed", default="0"); p.set_defaults(fn=cmd_brief)
+    p = sub.add_parser("guard"); p.add_argument("--candidate", default=None); p.add_argument("--genome", default=None); p.set_defaults(fn=cmd_guard)
+    p = sub.add_parser("score"); p.add_argument("--candidate", default=None); p.add_argument("--patch", default=None)
+    p.add_argument("--genome", default=None); p.add_argument("--force", action="store_true")
+    p.add_argument("--no-archive", action="store_true"); add_meta(p); add_mode_split(p); p.set_defaults(fn=cmd_score)
+    p = sub.add_parser("rescore"); p.add_argument("--id", required=True); add_mode_split(p); p.set_defaults(fn=cmd_rescore)
+    p = sub.add_parser("ingest"); p.add_argument("--result", required=True); p.add_argument("--genome", default=None); add_meta(p); add_mode_split(p); p.set_defaults(fn=cmd_ingest)
+    p = sub.add_parser("board"); p.add_argument("--top", type=int, default=10); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_board)
+    p = sub.add_parser("impls"); p.add_argument("--axis", default=None); p.set_defaults(fn=cmd_impls)
+    p = sub.add_parser("adopt"); p.add_argument("--id", required=True); p.set_defaults(fn=cmd_adopt)
+
+    args = ap.parse_args(argv)
+    root = find_root(args.root)
+    try:
+        args.fn(root, args)
+    except cfgmod.ConfigError as e:
+        _fail(str(e), code=2)
+    except score.Rejection as e:   # guard/dup from any scoring verb (seed, score, rescore)
+        print(json.dumps({"rejected": e.kind, "detail": e.detail}), file=sys.stderr)
+        raise SystemExit(4 if e.kind == "guard" else 5)
+    except runner.InfraError as e:
+        _fail(f"infrastructure failure (not archived — retry): {e}", code=6)
+    except (surface.SurfaceError, runner.EvalFailure, ValueError, OSError) as e:
+        _fail(str(e), code=1)
+
+
+if __name__ == "__main__":
+    main()

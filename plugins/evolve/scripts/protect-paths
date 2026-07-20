@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""PreToolUse guard: block Write/Edit to an evolve project's protected paths.
+
+Defense-in-depth only — the real rail is isolated-export scoring (a planted file can't
+reach an eval regardless). This hook exists to catch the mistake EARLY, at the tool
+layer, with a message the agent can act on, instead of at scoring time.
+
+No-ops (exit 0) when: the project has no evolve/evolve.json; the campaign hasn't started
+(no archive yet — so /evolve:init can freely write the config/adapter it is generating);
+the target is a NEW file under the registry dir (adding an impl is the round's normal work);
+or EVOLVE_ALLOW_PROTECTED=1 is set (deliberate harness maintenance).
+Exit 2 = block, with the reason on stderr (fed back to the agent).
+"""
+
+import fnmatch
+import json
+import os
+import pathlib
+import sys
+
+
+def main():
+    if os.environ.get("EVOLVE_ALLOW_PROTECTED") == "1":
+        return 0
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return 0  # malformed hook input: never break the session over the guard
+
+    target = (payload.get("tool_input") or {}).get("file_path") or ""
+    if not target:
+        return 0
+    root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    root = pathlib.Path(root)
+
+    # Walk up to the enclosing repo/config — the edit may run from a subdir or worktree.
+    cfg_path = None
+    for base in [root, *root.parents]:
+        c = base / "evolve" / "evolve.json"
+        if c.exists():
+            cfg_path, root = c, base
+            break
+    if cfg_path is None:
+        return 0
+    # Disarmed until the campaign starts: before the first `evolve seed`, /evolve:init is
+    # still generating the config + adapter (which live under the protected globs) and must
+    # be free to write them.
+    if not (root / "evolve" / "archive" / "genomes.jsonl").exists():
+        return 0
+    try:
+        cfg = json.loads(cfg_path.read_text())
+        protected = cfg.get("protected") or []
+        reg = ((cfg.get("surface") or {}).get("registry") or {}).get("dir")
+    except (json.JSONDecodeError, OSError):
+        return 0
+
+    try:
+        rel = str(pathlib.Path(target).resolve().relative_to(root.resolve()))
+    except ValueError:
+        return 0  # outside this project entirely
+
+    # Adding a NEW impl file under the registry dir is the round's normal work, not tampering.
+    if reg and rel.startswith(reg.rstrip("/") + "/") and not (root / rel).exists():
+        return 0
+
+    for g in protected:
+        if fnmatch.fnmatch(rel, g) or fnmatch.fnmatch(rel, g.rstrip("/*") + "/*"):
+            print(f"evolve: '{rel}' is a protected path (matches '{g}' in evolve/evolve.json). "
+                  "Protected paths — the eval adapter, the archive, the config — may not be edited "
+                  "during evolution; a candidate that needs this change is invalid. For deliberate "
+                  "harness maintenance set EVOLVE_ALLOW_PROTECTED=1.", file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
