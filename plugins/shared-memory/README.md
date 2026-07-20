@@ -53,15 +53,28 @@ The plugin ships **tooling plus the store's own doctrine** — skills, hooks, sc
 
 ## Install
 
-The plugin ships in a marketplace; install it, then run the one-time setup:
+Requires Claude Code and `python3`. From a clone of this repo:
 
 ```
-claude plugin marketplace add <this-repo>
+# 1. Register this repo as a local marketplace (run from the repo root)
+claude plugin marketplace add .
+
+# 2. Install the plugin (user scope by default)
 claude plugin install shared-memory@claudemods
-memory-init                    # seed the store, wire the @import + permission rules
+
+# 3. Activate it in the current session — run the slash command (or restart Claude Code):
+/reload-plugins
+
+# 4. Seed the store + wire recall, from a Claude Code Bash step:
+memory-init
 ```
 
-`memory-init` is deterministic and idempotent: it creates the store at `~/.claudemods/shared-memory/`, seeds the five doctrine memories from verbatim templates, adds the two `@import` lines to `~/.claude/CLAUDE.md` (inside `<!-- shared-memory:begin/end -->` sentinels), and adds the store's read/edit permission rules to `~/.claude/settings.json`. Config files are backed up before any edit, settings are parse-validated and written atomically, and re-running converges (nothing is duplicated). New sessions then load the shared index automatically — including the subagents they spawn.
+Two independent pieces, and you need **both**:
+
+- **Enabling the plugin** (steps 1–3) is what activates the `capture` / `eval` / `SessionStart` domain-recall / `SessionEnd` reflection hooks and puts the plugin's `bin/` on the Bash tool's PATH. `bin/` is added to the **Bash-tool** PATH, not your interactive shell — so `memory-init` runs *inside* a Claude Code session (after `/reload-plugins`), not from your terminal. A local marketplace does not auto-register from this repo's project `enabledPlugins`; step 1 is required.
+- **`memory-init`** (step 4) creates the store at `~/.claudemods/shared-memory/`, seeds the five doctrine memories from verbatim templates, adds the two `@import` lines to `~/.claude/CLAUDE.md` (inside `<!-- shared-memory:begin/end -->` sentinels), and adds the store's read/edit permission rules to `~/.claude/settings.json`. It's deterministic and idempotent: config files are backed up before any edit, settings are parse-validated and written atomically, and re-running converges. It's a plain script, so it also runs directly with no plugin needed: `python3 plugins/shared-memory/bin/memory-init`.
+
+Running `memory-init` *without* enabling the plugin gives you flat `@import` recall + permission rules, but **no** capture, domain-scoped recall, post-write eval, or reflection — those live in the plugin's hooks. New sessions then load the shared index automatically, including the subagents they spawn.
 
 Run `memory-init --doctor` any time for a read-only health pass (wiring drift, plugin build freshness, recall health, projection integrity, coverage, version drift, ignore confinement); it emits JSON and exits 2 if any check fails, but never self-heals — the fix for drift is `memory-init` again.
 

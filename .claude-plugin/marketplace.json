@@ -5,7 +5,7 @@
     {
       "name": "shared-memory",
       "source": "./plugins/shared-memory",
-      "description": "Shared memory store tooling: distill, doctrine, and (coming) capture/review/reflect"
+      "description": "Distills generalizable lessons from per-project auto-memory into a git-shareable store: distill, review, reflect, capture + post-write eval, domain-scoped recall, and shipped doctrine"
     }
   ]
 }
