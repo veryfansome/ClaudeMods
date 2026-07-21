@@ -21,17 +21,44 @@ Three things, created by `/evolve:init` and validated by `evolve doctor`:
 2. **Eval commands** (`proxy` cheap screen, `full` promotion budget, optional `final` holdout) emitting `combined_score` + optional `public` / `private` / `text_feedback` / `correct` — ShinkaEvolve's evaluator contract, verbatim.
 3. **`evolve/evolve.json`** — the declarative contract: task, surface, protected paths, budgets, search knobs.
 
-## Use
+## Install
+
+Requires Claude Code, `python3`, and `git` (scoring exports HEAD with `git archive`). From a clone of this repo:
 
 ```
+# 1. Register this repo as a local marketplace (run from the repo root)
+claude plugin marketplace add .
+
+# 2. Install the plugin (user scope by default)
 claude plugin install evolve@claudemods
 
-/evolve:init      # interview → surface → adapter → verification (won't finish until the contract holds)
+# 3. Activate it in the current session — run the slash command (or restart Claude Code):
+/reload-plugins
+```
+
+Enabling the plugin is what puts the engine CLI (`bin/evolve`) on the **Bash-tool** PATH — so `evolve …` runs *inside* a Claude Code session (after `/reload-plugins`), not from your terminal — and arms the `PreToolUse` hook that guards a project's protected paths during a run. A local (directory-source) marketplace does not auto-register from this repo's project `enabledPlugins`; step 1 is required. If you've added the marketplace before and just pulled new commits, run `claude plugin marketplace update claudemods` before installing so the new manifest is picked up.
+
+Nothing global is created — unlike a store-backed plugin, `evolve` holds no state of its own. All state lives per-project under `evolve/`, created by the setup below.
+
+## Use in a project
+
+From inside the target project (a git repo), in a Claude Code session:
+
+```
+/evolve:init      # interview → choose surface → generate the eval adapter → verify
+                  #   (won't finish until the contract holds: markers/registry parse,
+                  #    the seed scores, a sabotage mutant fails, an out-of-block edit is rejected)
 /evolve:round     # one generation; /loop 20m /evolve:round for unattended search
 /evolve:status    # board, budget, staleness, next step
 ```
 
-The engine CLI is also usable directly (`evolve board`, `evolve sample`, `evolve score …`) — see `evolve --help`. Exit codes 3/4/5 (budget / guard / duplicate) are the control-flow signals the round skill acts on.
+`/evolve:init` scaffolds `evolve/` (config, archive, manual) and commits the seed state; from then on the project owns its contract. The engine CLI is also usable directly — `evolve board`, `evolve sample`, `evolve score …`, `evolve rescore …`, `evolve doctor --measure-noise`; see `evolve --help`. Exit codes are the round loop's control signals: **3** budget exhausted, **4** guard violation, **5** novelty (duplicate) rejection, **6** infrastructure failure (export/setup — not archived, retry).
+
+**Uninstall:** `claude plugin uninstall evolve@claudemods` removes the plugin and disarms the hook. A project's `evolve/` directory is yours — it stays until you delete it; unwired, it is inert data.
+
+## Developing the plugin
+
+Enabled plugins run a **frozen install-time cache snapshot**, not your working copy — so edits to `bin/` or the skills don't take effect until you reinstall. To exercise current code without reinstalling, launch with `claude --plugin-dir plugins/evolve` from the repo root. Run the offline test suite with `plugins/evolve/tests/run` (no model calls, no network).
 
 ## What is deliberately not here (v1)
 
