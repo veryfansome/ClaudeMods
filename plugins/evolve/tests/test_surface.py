@@ -122,6 +122,22 @@ class TestRegistry(unittest.TestCase):
         files = surface.genome_impl_files(g, self.root, self.cfg)
         self.assertEqual(files, ["evolve/chunks/objective/better.py"])
 
+    def test_tracked_dirty_archive_does_not_trip_guard(self):
+        # Regression: with the archive TRACKED (committed as ground truth) and freshly appended
+        # to, the engine's own state-dir writes must NOT be flagged as candidate tampering —
+        # otherwise every score after the first in a round is rejected.
+        adir = self.root / "evolve" / "archive"
+        adir.mkdir(parents=True, exist_ok=True)
+        (adir / "genomes.jsonl").write_text('{"id":"gen0","mode":"proxy","split":"inner","fitness":1.0}\n')
+        git(["add", "-A"], self.root)
+        git(["commit", "-q", "-m", "track archive"], self.root)
+        (adir / "genomes.jsonl").write_text(                       # simulate a prior score's append
+            '{"id":"gen0","mode":"proxy","split":"inner","fitness":1.0}\n'
+            '{"id":"g1","mode":"proxy","split":"inner","fitness":2.0}\n')
+        report = surface.guard_registry(surface.baseline_genome(self.cfg), self.root, self.cfg)
+        self.assertTrue(report["ok"], report)                      # not a violation
+        self.assertFalse(any("genomes.jsonl" in v for v in report["violations"]))
+
 
 if __name__ == "__main__":
     unittest.main()

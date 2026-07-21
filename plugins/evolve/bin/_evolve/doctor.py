@@ -41,8 +41,13 @@ def run(root, run_eval=False, measure_noise=False, dry=False):
     # Only TRACKED modifications matter: pristine clones export HEAD, so a modified tracked
     # file (surface code, committed eval adapter) is invisible to scoring. Untracked files
     # (the archive, registry impls added this campaign) are expected state, not drift.
-    tracked_mods = subprocess.run(["git", "diff", "--name-only", "HEAD"], cwd=root,
-                                  capture_output=True, text=True).stdout.split()
+    # Exclude the engine's own state dir: the archive is tracked-and-appended by design, so
+    # it is legitimately dirty after every score — warning about it would be permanent noise.
+    # Surface source and the (project-side) eval adapter live outside evolve/, and those ARE
+    # what "invisible to scoring" is about.
+    tracked_mods = [p for p in subprocess.run(["git", "diff", "--name-only", "HEAD"], cwd=root,
+                                              capture_output=True, text=True).stdout.split()
+                    if not (p == cfgmod.STATE_DIR or p.startswith(cfgmod.STATE_DIR + "/"))]
     if tracked_mods:
         warnings.append(f"tracked files modified vs HEAD {tracked_mods[:8]} — clones export HEAD, "
                         "so these changes are invisible to scoring; commit them before evolving")
