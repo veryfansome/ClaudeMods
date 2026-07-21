@@ -33,7 +33,7 @@ DEFAULTS = {
         "splits": [DEFAULT_SPLIT],   # 'final' may be appended to enable the holdout rail
     },
     "fitness": {"noise_floor": None, "noise_runs": 5, "noise_meta": None,
-                "selection_env": None},
+                "selection_env": None, "env_offsets": {}},
     "search": {
         "lambda": 10.0,
         "inspirations": {"archive": 2, "top_k": 2},

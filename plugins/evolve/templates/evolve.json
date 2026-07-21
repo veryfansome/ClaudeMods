@@ -22,7 +22,7 @@
     "full": { "cmd": null, "seeds": [0, 1, 2], "timeout_s": 3600 },
     "splits": ["inner"]
   },
-  "fitness": { "noise_floor": null, "noise_runs": 5, "noise_meta": null, "selection_env": null },
+  "fitness": { "noise_floor": null, "noise_runs": 5, "noise_meta": null, "selection_env": null, "env_offsets": {} },
   "search": {
     "lambda": 10.0,
     "inspirations": { "archive": 2, "top_k": 2 },

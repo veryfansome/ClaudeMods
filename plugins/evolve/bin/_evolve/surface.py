@@ -17,7 +17,7 @@ import hashlib
 import pathlib
 import subprocess
 
-from .config import STATE_DIR, state_dir
+from .config import CONFIG_NAME, STATE_DIR, state_dir
 
 MARK_START = "EVOLVE-BLOCK-START"
 MARK_END = "EVOLVE-BLOCK-END"
@@ -238,18 +238,22 @@ def guard_registry(genome, root, cfg):
     except SurfaceError as e:
         violations.append(str(e))
     reg_rel = cfg["surface"]["registry"]["dir"].rstrip("/")
-    state_rel = STATE_DIR                # the engine's own dir (archive/config/manual/insights)
+    # Paths the ENGINE itself legitimately writes as tracked state (the archive it self-appends
+    # every score; the config `doctor --measure-noise/--measure-env-offset` rewrites out of band).
+    # These show as tracked-dirty through no fault of the candidate, so exempt exactly these two
+    # from the protected-modified check — NOT the whole state dir, so any other protected path
+    # (even one placed under evolve/) still gets guarded. A candidate cannot reach either at
+    # score time (impls go to the registry dir; eval runs in an isolated export); the config is
+    # additionally guarded against agent Write/Edit by the protect-paths hook.
+    archive_rel = f"{STATE_DIR}/archive"
+    config_rel = f"{STATE_DIR}/{CONFIG_NAME}"
     protected = cfg.get("protected", [])
     for path in changed_files(root, diff_filter="MD"):  # staged additions are legitimate
         if path.startswith(reg_rel + "/"):
             violations.append(f"existing registry impl modified/deleted: {path} — impls are "
                               "append-only (archived genomes must stay reproducible); "
                               "add a new impl file instead")
-        elif path == state_rel or path.startswith(state_rel + "/"):
-            # The engine writes its own state dir every score (the archive append, its
-            # artifacts); that is bookkeeping, not candidate tampering, so it must not be
-            # flagged even when the archive is tracked. A candidate's only legitimate footprint
-            # here is a NEW impl under the registry dir, covered by the append-only check above.
+        elif path == config_rel or path == archive_rel or path.startswith(archive_rel + "/"):
             continue
         elif _matches_any(path, protected):
             violations.append(f"protected path modified: {path}")

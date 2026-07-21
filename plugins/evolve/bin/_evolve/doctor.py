@@ -8,12 +8,13 @@ config (with backup), because a promotion gate calibrated by assertion instead o
 measurement is how noise gets promoted as fitness.
 """
 
+import datetime
 import hashlib
 import json
 import pathlib
 import subprocess
 
-from . import archive, config as cfgmod, runner, surface
+from . import archive, config as cfgmod, runner, score, surface
 from .score import default_env
 
 
@@ -183,3 +184,68 @@ def _baseline_runs(root, cfg, runs):
 def _result(checks, warnings):
     ok = all(c["ok"] for c in checks)
     return {"ok": ok, "checks": checks, "warnings": warnings}
+
+
+def measure_env_offset(root, ref_id=None, dry=False):
+    """Measure this environment's fitness offset vs. the environment a reference candidate was
+    scored in — the 'measure-then-decide' upgrade to the plugin's assume-incomparable-and-warn
+    stance. Re-runs the reference (default: the champion) here, diffs against its recorded
+    fitness, and writes fitness.env_offsets[<this env>] with the same provenance shape as the
+    noise floor. Informs whether environments may be folded (offset within noise) or must stay
+    partitioned via selection_env; never gates on its own."""
+    cfg = cfgmod.load(root)
+    sel_env = cfg["fitness"].get("selection_env")
+    if ref_id:
+        scored = [r for r in archive.load(root)
+                  if r["id"] == ref_id and isinstance(r.get("fitness"), (int, float))]
+        # the id's authoritative recorded score (full outranks proxy, then higher fitness)
+        ref = max(scored, key=lambda r: (r.get("mode") == "full", r["fitness"])) if scored else None
+    else:
+        ref = archive.best(root, sel_env)
+    if ref is None:
+        return {"ok": False, "error": f"no reference candidate to measure against "
+                f"({'id ' + repr(ref_id) if ref_id else 'no champion — score something first'})"}
+    if ref.get("fitness") is None:
+        return {"ok": False, "error": f"reference {ref['id']!r} has no numeric fitness to compare against"}
+
+    here = default_env()
+    ref_env, ref_fitness, ref_mode = ref.get("env"), ref["fitness"], ref.get("mode", "proxy")
+    ref_split = ref.get("split", cfgmod.DEFAULT_SPLIT)
+    warnings = []
+    if ref_env == here:
+        warnings.append(f"reference was already scored in this env ({here}) — the offset just "
+                        "re-measures run-to-run noise, not a cross-env gap")
+
+    try:
+        rerun = score.rescore(root, cfg, rec_id=ref["id"], mode=ref_mode, split=ref_split,
+                              env=here, no_archive=True)
+    except (ValueError, score.Rejection, runner.EvalFailure, runner.InfraError,
+            surface.SurfaceError) as e:
+        return {"ok": False, "error": f"could not re-run reference {ref['id']!r} here: {e}"}
+    if rerun.get("fitness") is None:
+        return {"ok": False, "error": f"reference {ref['id']!r} failed to score in this env: "
+                f"{rerun.get('guardrail')}"}
+
+    offset = round(rerun["fitness"] - ref_fitness, 6)
+    measured_floor = cfg["fitness"].get("noise_floor")
+    floor = measured_floor if measured_floor is not None else 0.0
+    if measured_floor is None:
+        warnings.append("fitness.noise_floor is unmeasured — the comparability verdict below uses "
+                        "0.0 (strictest) and is UNCALIBRATED; run `evolve doctor --measure-noise` first")
+    comparable = abs(offset) <= floor
+    verdict = ("environments are comparable within the noise floor — you may leave "
+               "fitness.selection_env unset and fold their scores"
+               if comparable else
+               "offset EXCEEDS the noise floor — scores are not comparable; set "
+               "fitness.selection_env to one env so cross-env records don't corrupt selection")
+    entry = {"offset": offset, "ref_id": ref["id"], "ref_env": ref_env, "mode": ref_mode,
+             "split": ref_split, "noise_floor": measured_floor,
+             "measured_at": datetime.date.today().isoformat(),
+             **_noise_signature(cfg)}
+    cfg["fitness"].setdefault("env_offsets", {})[here] = entry
+    if not dry:
+        cfgmod.save(cfg, root)
+    return {"ok": True, "current_env": here, "ref_env": ref_env, "ref_id": ref["id"],
+            "ref_fitness": ref_fitness, "fitness_here": rerun["fitness"], "offset": offset,
+            "noise_floor": floor, "comparable": comparable, "verdict": verdict,
+            "stored": (None if dry else f"fitness.env_offsets[{here!r}]"), "warnings": warnings}

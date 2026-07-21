@@ -5,7 +5,7 @@ biased by an earlier round's editorializing. Budget state comes purely from the 
 so it survives sessions and machines with zero process memory.
 """
 
-from . import archive
+from . import archive, prereg
 from .config import FINAL_SPLIT, DEFAULT_SPLIT
 
 
@@ -56,6 +56,8 @@ def report(root, cfg, top=10):
         "budget": archive.budget_state(root, cfg["budget"], sel_env),
         "noise_floor": cfg["fitness"].get("noise_floor"),
         "selection_env": sel_env,
+        "env_offsets": cfg["fitness"].get("env_offsets") or {},
+        "active_prereg": prereg.active(root),
         "environments": envs,
         "records": {"total": len(recs), "selection_split": len(selection), "final_split": len(final)},
         "by_inventor": _by(selection, "inventor"),
@@ -88,6 +90,16 @@ def render(rep):
                  + (f"   selection_env: {rep['selection_env']}" if rep.get("selection_env") else ""))
     for w in rep.get("warnings", []):
         lines.append(f"⚠ {w}")
+    pr = rep.get("active_prereg")
+    if pr:
+        g2 = pr.get("g2") or {}
+        lines.append(f"\nACTIVE PREREG ({pr['round']}): G1 fitness floor ≥ {pr['g1_fitness_floor']} "
+                     f"(sacred, vs champion {pr['champion']['id']}); G2: {g2.get('desc') or '—'}"
+                     + (f" (≥ {g2['threshold']})" if g2.get('threshold') is not None else ""))
+    if rep.get("env_offsets"):
+        for env, e in rep["env_offsets"].items():
+            lines.append(f"env offset [{env}]: {e['offset']:+.4f} vs {e['ref_env']} "
+                         f"({'comparable' if abs(e['offset']) <= (e.get('noise_floor') or 0) else 'PARTITION'})")
     if rep["final_split_runs"]:
         lines.append("final-split validations (never used for selection): "
                      + ", ".join(f"{r['id']}={r['fitness']}" for r in rep["final_split_runs"]))

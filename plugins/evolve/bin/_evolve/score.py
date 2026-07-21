@@ -251,15 +251,23 @@ def score_seed(root, cfg, *, mode="proxy", split=DEFAULT_SPLIT, env=None, seed_i
                            genome=surface.baseline_genome(cfg), env=env, no_archive=no_archive)
 
 
-def rescore(root, cfg, *, rec_id, mode, split=DEFAULT_SPLIT, env=None):
+def rescore(root, cfg, *, rec_id, mode, split=DEFAULT_SPLIT, env=None, no_archive=False):
     """Re-run an already-archived candidate under a (possibly) new mode/split, reusing its id
     — the primitive for proxy->full promotion, paired champion reruns, and final-split
     validation. Replays from the stored artifact (patch or genome), so it needs no worktree
-    and self-excludes from dedup. The id-payload check guarantees the same code runs."""
+    and self-excludes from dedup. The id-payload check guarantees the same code runs.
+    no_archive replays it WITHOUT recording (e.g. an env-offset measurement)."""
     matches = [r for r in archive.load(root) if r["id"] == rec_id]
     if not matches:
         raise ValueError(f"no archived candidate with id {rec_id!r} to re-score")
-    src = matches[-1]
+    # Prefer the most-recent record that actually carries reproducible CODE — an id can also
+    # have an ingested record (score only, no artifact), e.g. after a cross-env ingest, and
+    # that one can't be replayed. Fall back to the latest record (handles the empty-patch seed).
+    if cfg["surface"]["mode"] == "markers":
+        repro = [r for r in matches if (r.get("surface") or {}).get("patch")]
+    else:
+        repro = [r for r in matches if isinstance(r.get("genome"), dict)]
+    src = repro[-1] if repro else matches[-1]
     surf = src.get("surface") or {}
     meta = {"id": rec_id, "parent": src.get("parent"), "generation": src.get("generation"),
             "inventor": src.get("inventor"), "operator": src.get("operator"),
@@ -276,13 +284,13 @@ def rescore(root, cfg, *, rec_id, mode, split=DEFAULT_SPLIT, env=None):
                              "record carries only its score, not its code; re-score it where it was "
                              "produced, or score the candidate locally under a fresh id")
         return score_candidate(root, cfg, mode=mode, split=split, meta=meta, patch=patch,
-                               env=env, force=True)
+                               env=env, force=True, no_archive=no_archive)
     genome = src.get("genome")
     if not isinstance(genome, dict):
         raise ValueError(f"record {rec_id!r} carries no genome to re-score")
     _restore_impls(root, cfg, genome, surf.get("impls_artifact"))
     return score_candidate(root, cfg, mode=mode, split=split, meta=meta, genome=genome,
-                           env=env, force=True)
+                           env=env, force=True, no_archive=no_archive)
 
 
 def _restore_impls(root, cfg, genome, artifact_rel):

@@ -11,6 +11,9 @@ inventors; this CLI decides. Verbs:
   brief           the full inventor brief context for one slot (markdown)
   guard           validate a candidate (worktree or genome) without scoring
   score           guard -> dedup -> pristine-clone eval -> record
+  preregister     commit a round's promotion gates BEFORE scoring candidates (immutable);
+                  G1 fitness-non-regression is auto-derived from the champion + noise floor
+  gate            check a candidate against a round's pre-registered gates (G1 is numeric)
   rescore         re-run an archived candidate under a new mode/split, reusing its id
                   (proxy->full promotion, paired champion rerun, final-split validation)
   ingest          append an externally-scored result (tag --env; scores only compare
@@ -32,7 +35,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from _evolve import archive, board, brief, config as cfgmod, doctor, runner, scaffold, score, surface  # noqa: E402
+from _evolve import archive, board, brief, config as cfgmod, doctor, prereg, runner, scaffold, score, surface  # noqa: E402
 
 
 def find_root(explicit):
@@ -67,9 +70,26 @@ def cmd_init(root, args):
 
 
 def cmd_doctor(root, args):
+    if args.measure_env_offset:
+        res = doctor.measure_env_offset(root, ref_id=args.ref, dry=args.dry)
+        print(json.dumps(res, indent=1))
+        raise SystemExit(0 if res.get("ok") else 2)
     res = doctor.run(root, run_eval=args.run_eval, measure_noise=args.measure_noise, dry=args.dry)
     print(json.dumps(res, indent=1))
     raise SystemExit(0 if res["ok"] else 2)
+
+
+def cmd_preregister(root, args):
+    cfg = cfgmod.load(root)
+    rec = prereg.register(root, cfg, round_tag=args.round, g2_desc=args.g2,
+                          g2_threshold=args.g2_threshold, g3_desc=args.g3, split=args.split)
+    print(json.dumps(rec, indent=2))
+
+
+def cmd_gate(root, args):
+    cfg = cfgmod.load(root)
+    rep = prereg.check_gate(root, cfg, round_tag=args.round, candidate_id=args.id)
+    print(json.dumps(rep, indent=2))
 
 
 def cmd_seed(root, args):
@@ -230,7 +250,11 @@ def main(argv=None):
 
     p = sub.add_parser("init"); p.add_argument("--mode", default="markers", choices=["markers", "registry"]); p.set_defaults(fn=cmd_init)
     p = sub.add_parser("doctor"); p.add_argument("--run-eval", action="store_true")
-    p.add_argument("--measure-noise", action="store_true"); p.add_argument("--dry", action="store_true"); p.set_defaults(fn=cmd_doctor)
+    p.add_argument("--measure-noise", action="store_true"); p.add_argument("--dry", action="store_true")
+    p.add_argument("--measure-env-offset", action="store_true",
+                   help="re-run a reference candidate here and record this env's fitness offset")
+    p.add_argument("--ref", default=None, help="reference candidate id for --measure-env-offset (default: champion)")
+    p.set_defaults(fn=cmd_doctor)
     p = sub.add_parser("seed"); add_mode_split(p); p.add_argument("--id", default="gen0-baseline")
     p.add_argument("--no-archive", action="store_true"); p.set_defaults(fn=cmd_seed)
     p = sub.add_parser("sample"); p.add_argument("--k", type=int, default=3); p.add_argument("--seed", default="0"); p.set_defaults(fn=cmd_sample)
@@ -241,6 +265,13 @@ def main(argv=None):
     p = sub.add_parser("score"); p.add_argument("--candidate", default=None); p.add_argument("--patch", default=None)
     p.add_argument("--genome", default=None); p.add_argument("--force", action="store_true")
     p.add_argument("--no-archive", action="store_true"); add_meta(p); add_mode_split(p); p.set_defaults(fn=cmd_score)
+    p = sub.add_parser("preregister"); p.add_argument("--round", required=True)
+    p.add_argument("--g2", required=True, help="the round objective: a one-line predicate")
+    p.add_argument("--g2-threshold", dest="g2_threshold", type=float, default=None)
+    p.add_argument("--g3", default=None, help="advisory metric (non-sufficient, non-necessary)")
+    p.add_argument("--split", default=None); p.set_defaults(fn=cmd_preregister)
+    p = sub.add_parser("gate"); p.add_argument("--round", required=True); p.add_argument("--id", required=True)
+    p.set_defaults(fn=cmd_gate)
     p = sub.add_parser("rescore"); p.add_argument("--id", required=True); add_mode_split(p); p.set_defaults(fn=cmd_rescore)
     p = sub.add_parser("ingest"); p.add_argument("--result", required=True); p.add_argument("--genome", default=None); add_meta(p); add_mode_split(p); p.set_defaults(fn=cmd_ingest)
     p = sub.add_parser("board"); p.add_argument("--top", type=int, default=10); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_board)

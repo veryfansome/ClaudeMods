@@ -15,17 +15,28 @@ An LLM-driven evolutionary search over a marked part of this repo ({{MODE}} mode
 ## How a round runs (the `/evolve:round` skill drives this)
 
 1. Re-ground: `evolve board`, read `insights.md`.
-2. `evolve sample --k N` — parents (fitness+novelty weighted, offspring-penalized), operators, inspirations per slot. Refuses when the budget is spent.
-3. `evolve brief` per slot → dispatch inventor agents (heterogeneous, high effort).
-4. `evolve guard` each proposal → fix-or-re-brief on violations (bounded retries).
-5. `evolve score --mode proxy` each survivor — guard, dedup, pristine clone, smoke, eval, record. Failures are recorded with reasons; they are search signal.
-6. Promote proxy winners beating the champion by > noise floor to `--mode full`; for noisy evals, rerun the champion back-to-back first (paired comparison).
-7. Recombine winners (cross operator / stacked genome) and score the combination — epistasis is real in both directions; always test, never assume.
-8. Every few rounds: distill neutral stats into `insights.md` (≤5 recommendations; record numbers, not verdicts).
-9. Before any external claim: score the champion once on the `final` split.
+2. **Pre-register the gates** (before scoring): `evolve preregister --round <tag> --g2 "<objective>" [--g2-threshold N] [--g3 "<advisory>"]`. Commits what a win means *now*, so it can't be rationalized later. See "Promotion gates" below.
+3. `evolve sample --k N` — parents (fitness+novelty weighted, offspring-penalized), operators, inspirations per slot. Refuses when the budget is spent.
+4. `evolve brief` per slot → dispatch inventor agents (heterogeneous, high effort).
+5. `evolve guard` each proposal → fix-or-re-brief on violations (bounded retries).
+6. `evolve score --mode proxy` each survivor — guard, dedup, pristine clone, smoke, eval, record. Failures are recorded with reasons; they are search signal. The proxy **screens** (decides whether to spend a full run); it never promotes.
+7. Promote: full-budget re-score of a proxy winner (`evolve rescore --id <c> --mode full`), then `evolve gate --round <tag> --id <c>` → promote only if **G1 ∧ G2**. For noisy evals, pair the champion re-run at proxy first.
+8. Recombine winners (cross operator / stacked genome) and score the combination — epistasis is real in both directions; always test, never assume.
+9. Every few rounds: distill neutral stats into `insights.md` (≤5 recommendations; record numbers, not verdicts). A no-promotion round still closes with the measured trade-off frontier as its result.
+10. Before any external claim: score the champion once on the `final` split.
+
+## Promotion gates (pre-register before scoring)
+
+A win is decided by numbers fixed **before** any candidate is scored, not chosen after seeing results — this is what lets a striking-but-false proxy gain be rejected instead of rationalized. `evolve preregister` writes an immutable per-round manifest with three gates:
+
+- **G1 — fitness non-regression (sacred, auto-derived).** `champion − noise_floor`. A promotion may never drop primary fitness below it. `evolve gate` checks this for you.
+- **G2 — the round objective.** What this round is trying to move; you state the predicate (+ optional threshold) and judge it from the candidate's `public`/`text_feedback`.
+- **G3 — advisory.** Metrics worth watching; explicitly neither sufficient nor necessary.
+
+**Promote iff G1 ∧ G2.** A candidate that moves G2 but fails G1 is a trade-off finding, not a promotion. The proxy screens spending only; every promotion is re-scored at full budget (and validated on `final`) before it counts, because proxy→full can shrink *or invert*.
 
 ## Culture
 
 - **Record stats, not verdicts.** Negative results get archived with the same weight as wins.
 - **The eval is sacred.** No candidate, ever, edits the metric, the splits, or this directory. Deliberate harness maintenance is a normal reviewed change, made outside a round (set `EVOLVE_ALLOW_PROTECTED=1` for the session doing it), followed by `evolve doctor` and a fresh `--measure-noise`.
-- **Scores compare only within one environment.** Remote/offloaded results come in via `evolve ingest --env <tag>`. If the archive mixes environments (e.g. local proxy runs plus ingested remote scores), set `fitness.selection_env` to the one env selection should trust — records from other envs stay archived and reportable but are firewalled out of parent sampling, the leaderboard, and the champion (like the final split). Set it to the env you actually score in; note the seed is scored in the host env, so if you pin `selection_env` to a remote box, re-baseline a candidate there or selection will be empty (`board`/`doctor` warn when that happens).
+- **Scores compare only within one environment.** Remote/offloaded results come in via `evolve ingest --env <tag>`. If the archive mixes environments (e.g. local proxy runs plus ingested remote scores), set `fitness.selection_env` to the one env selection should trust — records from other envs stay archived and reportable but are firewalled out of parent sampling, the leaderboard, and the champion (like the final split). Set it to the env you actually score in; note the seed is scored in the host env, so if you pin `selection_env` to a remote box, re-baseline a candidate there or selection will be empty (`board`/`doctor` warn when that happens). Before trusting a new environment, run `evolve doctor --measure-env-offset` — it re-runs the champion there and records the fitness offset vs its home env, so you *measure* comparability instead of assuming it: within the noise floor → fold the envs; beyond it → partition with `selection_env`.

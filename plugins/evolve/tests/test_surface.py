@@ -122,6 +122,29 @@ class TestRegistry(unittest.TestCase):
         files = surface.genome_impl_files(g, self.root, self.cfg)
         self.assertEqual(files, ["evolve/chunks/objective/better.py"])
 
+    def test_engine_written_config_and_archive_exempt_but_other_protected_guarded(self):
+        # doctor writes the tracked config out of band; that dirty config must NOT block a score
+        # (same class as the tracked-archive bug), while a genuinely modified OTHER protected
+        # path (the eval) is still caught.
+        cfg = self.cfg
+        cfg["protected"] = ["evolve/evolve.json", "evolve/archive/**", "eval.py"]
+        adir = self.root / "evolve" / "archive"
+        adir.mkdir(parents=True, exist_ok=True)
+        (adir / "genomes.jsonl").write_text("{}\n")
+        git(["add", "-A"], self.root)
+        git(["commit", "-q", "-m", "track state + eval"], self.root)
+        g = surface.baseline_genome(cfg)
+        # engine-written state dirtied out of band: config (doctor) + archive self-append
+        p = self.root / "evolve" / "evolve.json"
+        p.write_text(p.read_text() + "\n")
+        (adir / "genomes.jsonl").write_text("{}\n{}\n")
+        self.assertTrue(surface.guard_registry(g, self.root, cfg)["ok"])   # both exempt
+        # a genuinely tampered OTHER protected path is still caught
+        (self.root / "eval.py").write_text("print('tampered')\n")
+        rep = surface.guard_registry(g, self.root, cfg)
+        self.assertFalse(rep["ok"])
+        self.assertTrue(any("eval.py" in v for v in rep["violations"]))
+
     def test_tracked_dirty_archive_does_not_trip_guard(self):
         # Regression: with the archive TRACKED (committed as ground truth) and freshly appended
         # to, the engine's own state-dir writes must NOT be flagged as candidate tampering —
