@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "evolve@claudemods": true,
+    "shared-memory@claudemods": true
+  }
+}

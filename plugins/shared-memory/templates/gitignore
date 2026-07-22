@@ -1,0 +1,10 @@
+MEMORY.local.md
+MEMORY.local.*.md
+local/
+.candidates.log
+.candidates.consumed
+.recall.log
+.runs.log
+.reflect/
+.probe-stamp.json
+.domains.json

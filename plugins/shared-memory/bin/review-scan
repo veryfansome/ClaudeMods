@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""review-scan: the mechanical front of /memory-review.
+
+Enumerates the LIVE memories from the host-store live indexes (MEMORY.md +
+MEMORY.local.md; v2 MEMORY.<domain>.md after M4) — NOT a recursive walk, which would
+sweep local/archive/ originals, RETIRED.md, the indexes, and mounted packs. Flags the
+mechanical part (last_verified staleness, the observed queue, the contradicted
+quarantine, guard-2 supersedes, advisory similarity) and runs two reconciliation diffs
+(body<->index and archive stamps). No use-evidence — recall telemetry is deferred to M3.
+Scripts never author beliefs; this one only reads. Output schema: see /memory-review.
+"""
+import datetime
+import difflib
+import glob
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _apply_common as ac  # noqa: E402  (sibling library module in bin/)
+
+HOME = os.path.expanduser("~")
+STORE = os.path.join(HOME, ".claudemods", "shared-memory")
+ARCHIVE = os.path.join(STORE, "local", "archive")
+RECALL_LOG = os.path.join(STORE, ".recall.log")    # M3: on-demand body reads (log-recall)
+RUNS_LOG = os.path.join(STORE, ".runs.log")        # M3: review-run windows to exclude from the signal
+MAX_RUN_SECONDS = 3600                             # bound an unclosed review window (crash-safety)
+STALE_DAYS = 180                                   # last_verified older than this is flagged; n/a is exempt
+SIMILARITY_FLOOR = 0.45                            # advisory hints only
+TOMBSTONE_TITLE = "contradicted — pending review"  # the pinned quarantine marker (title; no trailing guidance)
+INDEX_RE = ac.INDEX_RE   # centralized (M4): MEMORY.md / .local.md / .<domain>.md / .local.<domain>.md
+LINE_RE = re.compile(r"^- \[(?P<title>[^\]]*)\]\((?P<link>[^)]+)\)(?:\s+—\s+(?P<desc>.*))?$")
+
+
+def index_files():
+    return sorted(os.path.basename(p) for p in glob.glob(os.path.join(STORE, "*.md"))
+                  if INDEX_RE.match(os.path.basename(p)))
+
+
+def is_flat_index(name):
+    """A flat, always-@import-loaded index: MEMORY.md / MEMORY.local.md — no domain segment.
+    A domain projection (MEMORY.<domain>.md) legitimately repeats a line across files, so the
+    duplicate-line signal ([R9] D6) is scoped to the flat tier only."""
+    m = INDEX_RE.match(name)
+    return bool(m) and not m.group(2)
+
+
+def parse_index(index_name):
+    """(title, link, desc, tombstoned) per memory line in an index file."""
+    out = []
+    try:
+        text = open(os.path.join(STORE, index_name), encoding="utf-8").read()
+    except (OSError, UnicodeError):
+        return out   # an unreadable/undecodable index degrades to empty, never crashes the scan ([17])
+    for raw in text.splitlines():
+        m = LINE_RE.match(raw.strip())
+        if m:
+            out.append((m.group("title").strip(), m.group("link"), (m.group("desc") or "").strip(),
+                        m.group("title").strip() == TOMBSTONE_TITLE))
+    return out
+
+
+def parse_list(v):
+    v = (v or "").strip()
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    return [x.strip().strip('"').strip("'") for x in v.split(",") if x.strip()]
+
+
+def norm(s):
+    return re.sub(r"\s+", " ", (s or "").strip().casefold()).rstrip(" .:;—-")
+
+
+def is_stale(lv):
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", lv or "")
+    if not m or lv == "n/a":
+        return False
+    try:
+        d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return False
+    return (datetime.date.today() - d).days > STALE_DAYS
+
+
+def desc_matches(index_desc, body_desc, mtype, applies_when):
+    """The index line must carry the body description. A framework's index renders as
+    '<applies_when>: <description>', so strip the known applies_when prefix (or accept the
+    body desc as the index desc's suffix); case-fold + trailing punctuation ignored via norm()."""
+    idx, body = norm(index_desc), norm(body_desc)
+    if mtype == "framework":
+        aw = norm(applies_when)
+        if aw and idx.startswith(aw):
+            idx = idx[len(aw):].lstrip(" :—-").strip()
+        return idx == body or idx.endswith(body)
+    return idx == body
+
+
+def clusters(memories):
+    """Advisory near-duplicate hints over name+description — never partitions."""
+    keys = [norm(m["name"] + " " + m.get("_desc", "")) for m in memories]
+    out, seen = [], set()
+    for i in range(len(memories)):
+        group = [memories[i]["name"]]
+        for j in range(i + 1, len(memories)):
+            if difflib.SequenceMatcher(None, keys[i], keys[j]).ratio() >= SIMILARITY_FLOOR:
+                group.append(memories[j]["name"])
+        if len(group) > 1 and memories[i]["name"] not in seen:
+            score = max(difflib.SequenceMatcher(None, keys[i], keys[j]).ratio()
+                        for j in range(len(memories)) if j != i and memories[j]["name"] in group)
+            out.append({"cluster": group, "score": round(score, 2)})
+            seen.update(group)
+    return out
+
+
+def archive_reconcile():
+    """Half-done retires (distinct from the live-index review): an archive stamped
+    retired_from whose retire didn't finish — index line still present (pre-deindex),
+    an orphan de-indexed source still on disk (pre-delete), or no RETIRED.md line
+    (pre-ledger). A promote archive (promoted_to) is not a retire — skipped."""
+    retired = read_or_empty(os.path.join(STORE, "RETIRED.md"))
+    retired_names = set(re.findall(r"^- (\S+)", retired, re.M))
+    index_text = "".join(read_or_empty(os.path.join(STORE, i)) for i in index_files())
+    out = []
+    for ap in sorted(glob.glob(os.path.join(ARCHIVE, "*.md"))):
+        fields, _ = ac.parse_frontmatter(read_or_empty(ap))
+        rf = (fields or {}).get("retired_from")
+        if not rf or rf in retired_names:
+            continue  # not a retire stamp, or the retire finished (ledger line present)
+        base = os.path.basename(ap)
+        src = next((c for c in (os.path.join(STORE, base), os.path.join(STORE, "local", base))
+                    if os.path.exists(c)), None)
+        if src:
+            rel = os.path.relpath(src, STORE)
+            stage = "pre-deindex" if f"]({rel})" in index_text else "pre-delete"
+        else:
+            stage = "pre-ledger"
+        out.append({"archived": os.path.relpath(ap, STORE), "stage": stage})
+    return out
+
+
+def read_or_empty(path):
+    if not os.path.exists(path):
+        return ""
+    try:
+        return open(path, encoding="utf-8").read()
+    except (OSError, UnicodeError):
+        return ""   # a non-UTF-8/unreadable body degrades to empty (no frontmatter), never crashes ([17])
+
+
+def _read_jsonl(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def _run_windows():
+    """[(start_ts, end_ts)] from .runs.log — the review passes whose bulk body reads must be
+    excluded from the insufficiency signal. Sequential runs, so pair starts/stops FIFO; an
+    unclosed start (the current run, or a crash) is bounded by MAX_RUN_SECONDS."""
+    starts, windows = [], []
+    for rec in _read_jsonl(RUNS_LOG):
+        ev, ts = rec.get("event"), rec.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        if ev == "start":
+            starts.append(ts)
+        elif ev == "stop" and starts:
+            windows.append((starts.pop(0), ts))
+    windows.extend((s, s + MAX_RUN_SECONDS) for s in starts)
+    return windows
+
+
+def recall_summary(memories):
+    """Body-read INSUFFICIENCY signal (M3): count on-demand body reads per memory from
+    .recall.log, EXCLUDING reads inside a review-run window (.runs.log), joined to the live
+    memories by store-relative path (review-scan's own memories[] is the body→index map). A
+    read of a feedback/framework body ⇒ its index line was too weak to steer alone →
+    enrich_candidate; a reference read is expected use (rich body by design). Doctrine is
+    never logged by log-recall, so never appears here. NEVER a retirement signal — a memory
+    with zero reads is healthy, not stale."""
+    windows = _run_windows()
+    counts = {}
+    for rec in _read_jsonl(RECALL_LOG):
+        ts, path = rec.get("ts"), rec.get("path")
+        if path is None or not isinstance(ts, (int, float)):
+            continue
+        if any(lo <= ts <= hi for lo, hi in windows):
+            continue  # a read during a review pass — the confound the run-window filter removes
+        counts[path] = counts.get(path, 0) + 1
+    by_path = {m["path"]: m for m in memories}
+    out = []
+    for path, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        m = by_path.get(path)
+        if not m:
+            continue  # a read of something no longer in the live index (e.g. since-retired) — skip
+        t = m.get("type", "")
+        out.append({"name": m["name"], "path": path, "type": t, "reads": n,
+                    "enrich_candidate": t in ("feedback", "framework")})
+    return out
+
+
+def orphan_bodies(indexed):
+    out = []
+    for p in glob.glob(os.path.join(STORE, "*.md")) + glob.glob(os.path.join(STORE, "local", "*.md")):
+        b = os.path.basename(p)
+        if b == "RETIRED.md" or INDEX_RE.match(b):
+            continue
+        if os.path.realpath(p) not in indexed:
+            out.append(os.path.relpath(p, STORE))
+    return sorted(out)
+
+
+def main():
+    memories, indexed = [], set()
+    observed, contradicted, contra_not_tomb, tomb_not_contra = [], [], [], []
+    dangling, desc_drift, title_drift = [], [], []
+    duplicate_index_line, flat_indexed = [], set()
+    live_names = set()
+
+    for index_name in index_files():
+        for title, link, index_desc, tombstoned in parse_index(index_name):
+            body_path = os.path.join(STORE, link)  # index links are store-relative
+            rp = os.path.realpath(body_path)
+            flat = is_flat_index(index_name)
+            # M3: a memory tagged with N>=2 domains has an identical (generated) line in each of
+            # its projections; enumerate the body ONCE so every downstream signal (queues, drift,
+            # clusters) counts it once. Dedup by resolved body path — keep the first occurrence.
+            if rp in indexed:
+                # [R9] D6: a body linked twice in the FLAT tier (two MEMORY.md lines, or one each
+                # in MEMORY.md + MEMORY.local.md) loads twice on every session yet enumerates once
+                # — surface it. Projection repeats are by-design (generated), so scope to flat.
+                if flat and rp in flat_indexed:
+                    duplicate_index_line.append({"index": index_name, "name": title, "link": link})
+                continue
+            indexed.add(rp)
+            if flat:
+                flat_indexed.add(rp)
+            rel = os.path.relpath(body_path, STORE)
+            if not os.path.exists(body_path):
+                dangling.append({"index": index_name, "name": title, "missing_body": rel})
+                continue
+            fields, _ = ac.parse_frontmatter(read_or_empty(body_path))
+            fields = fields or {}
+            name = fields.get("name") or os.path.splitext(os.path.basename(body_path))[0].replace("_", "-")
+            basis = fields.get("basis", "")
+            doctrine = fields.get("doctrine") == "true"
+            lv = fields.get("last_verified", "") or "n/a"
+            rec = {"name": name, "path": rel, "index": index_name, "type": fields.get("type", ""),
+                   "basis": basis, "last_verified": lv, "stale": is_stale(lv) and not doctrine,
+                   "doctrine": doctrine, "domains": parse_list(fields.get("domains", "")),
+                   "supersedes": parse_list(fields.get("supersedes", "")),
+                   "_desc": fields.get("description", "")}
+            memories.append(rec)
+            live_names.add(name)
+            if basis == "observed":
+                observed.append(name)
+            if basis == "contradicted":
+                contradicted.append(name)
+                if not tombstoned:
+                    contra_not_tomb.append(name)      # still steering — the urgent flag
+            if tombstoned and basis != "contradicted":
+                tomb_not_contra.append(name)          # neutralized but unadjudicated
+            if basis != "contradicted" and not doctrine and rec["_desc"] and \
+                    not desc_matches(index_desc, rec["_desc"], rec["type"], fields.get("applies_when", "")):
+                desc_drift.append({"name": name, "index_desc": index_desc, "body_desc": rec["_desc"]})
+            # M4: the index-line title now renders from the body `title`; a flat []-line the belief
+            # channel authored can drift from it (a projection line can't — it's generated). Only
+            # check when the body declares a title and the line isn't a tombstone.
+            body_title = fields.get("title", "")
+            if not tombstoned and body_title and title != body_title:
+                title_drift.append({"name": name, "index_title": title, "body_title": body_title})
+
+    supersedes_live = [{"framework": r["name"], "still_live": still}
+                       for r in memories
+                       if (still := [n for n in r["supersedes"] if n in live_names])]
+    similar = clusters(memories)
+    recall = recall_summary(memories)   # M3 body-read insufficiency; needs path+type (not _desc)
+    for r in memories:
+        r.pop("_desc", None)  # internal only
+
+    json.dump({
+        "store": STORE, "memories": memories,
+        "flags": {"observed": observed, "contradicted": contradicted,
+                  "supersedes_live": supersedes_live, "similar": similar},
+        "reconcile": {"orphan_bodies": orphan_bodies(indexed), "dangling_index": dangling,
+                      "desc_drift": desc_drift, "title_drift": title_drift,
+                      "duplicate_index_line": duplicate_index_line,
+                      "contradicted_not_tombstoned": contra_not_tomb,
+                      "tombstoned_not_contradicted": tomb_not_contra, "archive": archive_reconcile()},
+        "recall": recall,   # M3: [{name, path, type, reads, enrich_candidate}] — enrich, never retire
+        "retired_ledger": read_or_empty(os.path.join(STORE, "RETIRED.md")),
+    }, sys.stdout, indent=1)
+    print()
+
+
+if __name__ == "__main__":
+    main()

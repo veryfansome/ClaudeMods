@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Layer-1 deterministic tests for the shared-memory plugin — no model calls, CI-ready.
+# (Recall/inheritance + P1 capture probes that need a live `claude -p` live in ../probes/recall-probes.sh.)
+set -u
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 required to run these tests (and to run the plugin itself)" >&2
+  exit 2
+fi
+cd "$(dirname "$0")/.."   # plugin root
+exec python3 -m unittest discover -s tests -p 'test_*.py' "$@"

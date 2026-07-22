@@ -1,0 +1,906 @@
+#!/usr/bin/env python3
+"""memory-init: deterministic setup/teardown for the shared-memory store.
+
+Runs AFTER the plugin is enabled (the plugin ships this script in bin/), so it
+never touches marketplace registration or plugin enablement — those precede it.
+Its job is everything downstream of "plugin is live":
+
+  install (default):  seed the store from verbatim templates, add the permission
+                      rules, then wire the @import block into ~/.claude/CLAUDE.md
+                      (rules before imports, so recall goes live already covered).
+  --uninstall:        reverse the WIRING only (import block + settings rules). Leaves the
+                      store, its machine-local .domains.json, and generated projections —
+                      your memories are yours. The plugin's own hooks stay live until you
+                      DISABLE THE PLUGIN; to fully remove: disable the plugin (stops the
+                      hooks), then optionally `rm -rf` the store. --uninstall warns if the
+                      plugin still appears enabled.
+
+Idempotent: a second install is a no-op (existing files skipped, the import
+block and each rule detected, not duplicated). Config files are backed up
+before any edit, settings.json is parse-validated and written atomically, so a
+botched run degrades visibly rather than bricking. Scripts mutate, skills
+converse: this is plumbing, so it is a script, not a skill.
+
+  --doctor:           read-only health pass (wiring drift, plugin enablement +
+                      build freshness, autoMemoryDirectory coverage, recall-health
+                      probe, CLI version drift, git check-ignore). Emits JSON; exit
+                      2 if any check fails. --doctor --no-probe skips the authed
+                      recall probe (fast, offline). install() runs the offline
+                      checks at its tail.
+
+  --list-domains:     print the domains that appear as tags on any memory (the set a repo may map to).
+  --map-repo <d>...:  set (REPLACE) the CURRENT repo's domain set in the machine-local .domains.json,
+                      so the SessionStart loader injects those domains' memories here. Domains are
+                      validated against --list-domains (a typo can't map to a nonexistent domain).
+  --map-repo-add <d>...:  like --map-repo but UNIONS the named domains into the repo's existing set
+                      (keeps the others) — the safe way to add one domain without clobbering the rest.
+
+Not yet supported (planned): --remote <url> (clone + group setup).
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import _apply_common as ac  # noqa: E402  (sibling library in bin/; repo_root + parse_frontmatter)
+TEMPLATES = os.path.join(os.path.dirname(HERE), "templates")
+HOME = os.path.expanduser("~")
+CLAUDE = os.path.join(HOME, ".claude")
+# the store lives outside ~/.claude: writes aren't sensitive-file-gated, so our own
+# permission rules are the policy (no per-write prompt). CLAUDE.md + settings stay in ~/.claude.
+STORE = os.path.join(HOME, ".claudemods", "shared-memory")
+CLAUDE_MD = os.path.join(CLAUDE, "CLAUDE.md")
+SETTINGS = os.path.join(CLAUDE, "settings.json")
+TS = time.strftime("%Y%m%d-%H%M%S")
+
+BEGIN, END = "<!-- shared-memory:begin -->", "<!-- shared-memory:end -->"
+IMPORT_BLOCK = f"{BEGIN}\n@~/.claudemods/shared-memory/MEMORY.md\n@~/.claudemods/shared-memory/MEMORY.local.md\n{END}\n"
+
+# template filename -> destination relative to the store ("gitignore" has no dot
+# in the templates dir so it can't act as an ignore file for the plugin itself)
+SEED = {
+    "framework_memory_gate.md": "framework_memory_gate.md",
+    "framework_a_guess_is_not_a_fact.md": "framework_a_guess_is_not_a_fact.md",
+    "framework_write_for_the_cold_reader.md": "framework_write_for_the_cold_reader.md",
+    "reference_store_memory_format.md": "reference_store_memory_format.md",
+    "framework_reflect_memories_back.md": "framework_reflect_memories_back.md",
+    "MEMORY.md": "MEMORY.md",
+    "MEMORY.local.md": "MEMORY.local.md",
+    "gitignore": ".gitignore",
+}
+
+# permission rules init owns: store read+EDIT allows (the store is outside ~/.claude, so
+# belief writes aren't sensitive-file-gated — our rules are the policy, no per-write prompt;
+# transparency comes from the harness rendering writes + the reflect-memories-back doctrine),
+# project reads, and the distill/review run-directory scratch allows.
+# NOTE: no Write(...) rules — Claude Code matches EVERY file-editing tool (Write, Edit,
+# NotebookEdit) against Edit(path) rules; a Write(path) allow rule is a no-op the CLI warns
+# about at startup. Edit(path) alone grants prompt-free Write (verified: CLI 2.1.210 warning +
+# a sandbox test that Edit grants a prompt-free Write-tool new-file create). See RETIRED_ALLOW.
+ALLOW = [
+    "Read(~/.claudemods/shared-memory/**)",
+    "Edit(~/.claudemods/shared-memory/**)",
+    "Read(~/.claude/projects/**)",
+    # double leading slash = ABSOLUTE path (a single slash is project-root-relative); and a
+    # rule matches only when the path AND its symlink target match, so both roots are needed
+    # (macOS resolves /tmp -> /private/tmp). Read + Edit only (Edit covers the Write tool).
+    "Read(//tmp/distill.*/**)",
+    "Edit(//tmp/distill.*/**)",
+    "Read(//private/tmp/distill.*/**)",
+    "Edit(//private/tmp/distill.*/**)",
+    # /memory-review's scratch run-dir (mktemp -d /tmp/review.XXXXXX), same anchors as distill
+    # (M2 §255 / M3).
+    "Read(//tmp/review.*/**)",
+    "Edit(//tmp/review.*/**)",
+    "Read(//private/tmp/review.*/**)",
+    "Edit(//private/tmp/review.*/**)",
+]
+ASK = []  # inform-don't-gate: store writes are allowed and surfaced (harness + reflect-back), not gated
+
+# Rules the installer USED to write and now retires: the redundant Write(...) allow rules (see
+# ALLOW note). wire_settings STRIPS any of these still in live settings on every --install (so a
+# machine that predates the change self-heals — --install is otherwise append-only), uninstall
+# removes them, and the doctor's wiring-drift flags any left behind. Their Edit(...) counterparts
+# stay in ALLOW, so write coverage is unchanged. (Justification is the CLI's own startup warning,
+# not the docs, which still list Write as a valid allow tool — a maintainer note, not doc-backed.)
+RETIRED_ALLOW = [
+    "Write(~/.claudemods/shared-memory/**)",
+    "Write(//tmp/distill.*/**)",
+    "Write(//private/tmp/distill.*/**)",
+    "Write(//tmp/review.*/**)",
+    "Write(//private/tmp/review.*/**)",
+]
+
+
+def log(action, what):
+    print(f"  {action:9s} {what}")
+
+
+def backup(path):
+    if not os.path.exists(path):
+        return
+    dst = f"{path}.smbak.{TS}"
+    n = 0
+    while os.path.exists(dst):  # never clobber an earlier backup (same-second re-run)
+        n += 1
+        dst = f"{path}.smbak.{TS}.{n}"
+    shutil.copy2(path, dst)
+    log("backup", dst)
+
+
+def merge_gitignore(template_path, target):
+    """Append template .gitignore lines missing from an existing one, in order,
+    preserving the user's own lines. Returns the count added. (A later template
+    can reserve a new machine-local path — e.g. .candidates.consumed — and a
+    re-run adds it to a store that predates it, rather than skipping the file.)"""
+    with open(target, encoding="utf-8") as f:
+        existing = f.read()
+    have = set(existing.splitlines())
+    with open(template_path, encoding="utf-8") as f:
+        want = [ln for ln in f.read().splitlines() if ln.strip() and ln not in have]
+    if not want:
+        return 0
+    sep = "" if existing == "" or existing.endswith("\n") else "\n"
+    with open(target, "a", encoding="utf-8") as f:
+        f.write(sep + "\n".join(want) + "\n")
+    return len(want)
+
+
+def seed_store():
+    print("store:")
+    os.makedirs(os.path.join(STORE, "local", "archive"), exist_ok=True)
+    for src, dest in SEED.items():
+        target = os.path.join(STORE, dest)
+        template_path = os.path.join(TEMPLATES, src)
+        if os.path.exists(target):
+            if dest == ".gitignore":  # the one seeded file that legitimately grows: merge missing lines
+                added = merge_gitignore(template_path, target)
+                log("merged", f"{dest} (+{added} line(s))") if added else log("present", dest)
+            else:
+                log("present", dest)
+        else:
+            shutil.copy2(template_path, target)
+            log("seeded", dest)
+    # the machine-local repo→domain map (M4): created empty, gitignored, populated by --map-repo
+    if not os.path.exists(DOMAINS_MAP):
+        with open(DOMAINS_MAP, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "repos": {}}, f, indent=1)
+        log("seeded", ".domains.json")
+    else:
+        log("present", ".domains.json")
+
+
+def wire_imports():
+    print("imports (~/.claude/CLAUDE.md):")
+    text = open(CLAUDE_MD, encoding="utf-8").read() if os.path.exists(CLAUDE_MD) else ""  # readability preflighted
+    if BEGIN in text:
+        log("present", "import block")
+        return
+    backup(CLAUDE_MD)
+    sep = "" if (text == "" or text.endswith("\n")) else "\n"
+    _atomic_write(CLAUDE_MD, text + sep + IMPORT_BLOCK)
+    log("wired", "import block")
+
+
+def unwire_imports():
+    print("imports (~/.claude/CLAUDE.md):")
+    if not os.path.exists(CLAUDE_MD):
+        log("absent", "CLAUDE.md")
+        return
+    text = open(CLAUDE_MD, encoding="utf-8").read()   # readability preflighted in uninstall()
+    if BEGIN not in text:
+        log("absent", "import block")
+        return
+    if END not in text:
+        # a begin sentinel with no end: don't guess where the block stops, or we
+        # could swallow foreign text below it. Leave it for a human.
+        print(f"  refusing to edit {CLAUDE_MD}: '{BEGIN}' without '{END}' — remove the block by hand", file=sys.stderr)
+        return
+    backup(CLAUDE_MD)
+    pre, _, rest = text.partition(BEGIN)
+    _, _, post = rest.partition(END)
+    new = (pre.rstrip("\n") + "\n" + post.lstrip("\n")).strip("\n")
+    if new:
+        _atomic_write(CLAUDE_MD, new + "\n")
+    else:
+        os.remove(CLAUDE_MD)  # nothing of ours was sharing the file
+        log("removed", "empty CLAUDE.md")
+    log("unwired", "import block")
+
+
+def load_settings():
+    if os.path.exists(SETTINGS):
+        return json.load(open(SETTINGS))
+    return {}
+
+
+def check_settings_parseable():
+    # fail fast and touch nothing if a pre-existing settings.json is malformed —
+    # we can't safely edit JSON we can't parse, and a clean message beats a traceback
+    if os.path.exists(SETTINGS):
+        try:
+            with open(SETTINGS) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            # unparseable OR unreadable (a directory, a perms error) — clean fail, not a traceback
+            sys.exit(f"memory-init: {SETTINGS} is not valid JSON / not readable ({e}); fix it and re-run — nothing was changed")
+        if not isinstance(data, dict):
+            # valid JSON but not an object (a list/scalar/null) — wire_settings would traceback on
+            # data.setdefault after seeding; reject cleanly here, before anything is changed ([12])
+            sys.exit(f"memory-init: {SETTINGS} is valid JSON but not an object (got {type(data).__name__}); fix it and re-run — nothing was changed")
+
+
+def check_claudemd_readable():
+    # install/uninstall preflight ([7]): catch a directory / permission-denied / non-UTF-8 CLAUDE.md
+    # BEFORE any mutation (seed_store/wire_settings), so wire_imports' read can't traceback mid-install
+    # after the store was already changed. The doctor does NOT call this — it reports an unreadable
+    # CLAUDE.md as a wiring-drift finding instead of exiting.
+    if os.path.islink(CLAUDE_MD) and not os.path.exists(CLAUDE_MD):
+        # a broken symlink: os.path.exists follows it and returns False, so it would slip past the
+        # read check below and then crash wire_imports' write AFTER seed_store/wire_settings mutated
+        sys.exit(f"memory-init: {CLAUDE_MD} is a broken symlink; fix it and re-run — nothing was changed")
+    if os.path.exists(CLAUDE_MD):
+        try:
+            open(CLAUDE_MD, encoding="utf-8").read()
+        except (OSError, UnicodeError) as e:
+            sys.exit(f"memory-init: {CLAUDE_MD} is not readable / not valid UTF-8 ({e}); fix it and re-run — nothing was changed")
+
+
+def write_settings(data):
+    real = os.path.realpath(SETTINGS)   # write THROUGH a symlink (dotfiles), don't detach it ([R4-A])
+    tmp = real + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    json.load(open(tmp))            # parse-validate before the swap
+    os.replace(tmp, real)           # atomic (same dir/filesystem as the resolved target)
+
+
+def _atomic_write(path, text):
+    # [13]/[R4-A]: temp-write + rename onto the RESOLVED target — a crash mid-write can't truncate
+    # the live file, AND a symlinked config (a dotfiles-managed CLAUDE.md) is written THROUGH rather
+    # than detached into a fresh regular file. Same-dir tmp keeps os.replace atomic (one filesystem).
+    real = os.path.realpath(path)
+    tmp = real + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, real)
+
+
+def wire_settings():
+    print("settings (~/.claude/settings.json):")
+    data = load_settings()
+    perms = data.setdefault("permissions", {})
+    changed = False
+    # self-heal: strip any RETIRED rule still present (install is otherwise append-only, so
+    # a settings.json written before a rule was retired would keep it — and keep warning)
+    for kind in ("allow", "ask"):
+        lst = perms.get(kind)
+        if not lst:
+            continue
+        keep = [r for r in lst if r not in RETIRED_ALLOW]
+        if len(keep) != len(lst):
+            perms[kind] = keep
+            changed = True
+            log("removed", f"{kind}: {len(lst) - len(keep)} retired rule(s)")
+    for kind, rules in (("allow", ALLOW), ("ask", ASK)):
+        if not rules:
+            continue   # [11]: never create an empty "ask": [] key — uninstall wouldn't remove it,
+        lst = perms.setdefault(kind, [])   # so it would survive the round-trip as a residual mutation
+        for rule in rules:
+            if rule in lst:
+                log("present", f"{kind}: {rule}")
+            else:
+                lst.append(rule)
+                changed = True
+                log("added", f"{kind}: {rule}")
+    if changed:
+        backup(SETTINGS)  # only when we're actually about to edit — a no-op install touches nothing
+        write_settings(data)
+
+
+def ours(rule):
+    # exact-match the literals init owns (current AND retired) — never a substring test, which
+    # would delete a foreign rule that merely contains "shared-memory" or "/tmp/distill." Retired
+    # rules are included so uninstall still removes a rule we wrote in an earlier version.
+    return rule in ALLOW or rule in ASK or rule in RETIRED_ALLOW
+
+
+def unwire_settings():
+    print("settings (~/.claude/settings.json):")
+    if not os.path.exists(SETTINGS):
+        log("absent", "settings.json")
+        return
+    data = load_settings()
+    perms = data.get("permissions", {})
+    changed = False
+    for kind in ("allow", "ask"):
+        if kind in perms:
+            kept = [r for r in perms[kind] if not ours(r)]
+            if len(kept) != len(perms[kind]):
+                changed = True
+                log("removed", f"{len(perms[kind]) - len(kept)} {kind} rule(s)")
+                if kept:
+                    perms[kind] = kept
+                else:
+                    del perms[kind]
+    if changed:
+        if not perms:
+            data.pop("permissions", None)
+        backup(SETTINGS)
+        if data:
+            write_settings(data)
+        else:
+            os.remove(SETTINGS)   # nothing of ours OR the user's remains — mirror unwire_imports ([11] sibling)
+            log("removed", "empty settings.json")
+    else:
+        log("absent", "our rules")
+
+
+# ---- doctor: a read-only health pass (M3) ------------------------------------------
+# Diagnoses; it does NOT mutate — the fix for drift is --install (idempotent), except the
+# `block-modified` state which --install can't repair (wire_imports short-circuits on
+# BEGIN-presence). Emits structured JSON a session or /memory-review renders.
+
+PLUGINS = os.path.join(CLAUDE, "plugins")
+STAMP = os.path.join(STORE, ".probe-stamp.json")   # machine-local; version(s) the probes passed on
+PLUGIN_ID = "shared-memory@claudemods"
+# machine-local paths that must stay gitignored + untracked on a remote-backed store
+INVENTORY = ["MEMORY.local.md", "MEMORY.local.*.md", "local/", ".candidates.log",
+             ".candidates.consumed", ".recall.log", ".runs.log", ".reflect/",
+             ".probe-stamp.json", ".domains.json"]
+DOMAINS_MAP = os.path.join(STORE, ".domains.json")   # machine-local repo→domain map (M4)
+RESERVED_DOMAINS = {"local"}                          # collides with the flat personal index
+
+
+def _chk(check, status, detail, findings=None, caveats=None):
+    return {"check": check, "status": status, "detail": detail,
+            "findings": findings or [], "caveats": caveats or []}
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def cli_version():
+    """The running Claude Code version, parsed from `claude --version` (P3:
+    '2.1.209 (Claude Code)'). None if claude isn't on PATH or the output can't be parsed."""
+    if not shutil.which("claude"):
+        return None
+    try:
+        out = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(\d+\.\d+\.\d+)", out)
+    return m.group(1) if m else None
+
+
+def check_wiring_drift():
+    findings = []
+    # --- CLAUDE.md import block: four states (+ an unreadable fifth) ---
+    try:
+        text = open(CLAUDE_MD, encoding="utf-8").read() if os.path.exists(CLAUDE_MD) else ""
+    except (OSError, UnicodeError) as e:
+        # a directory / permission-denied / non-UTF-8 CLAUDE.md must degrade to a finding, not
+        # traceback the whole read-only doctor pass ([7]) — the settings checks below still run
+        findings.append({"import_block": "unreadable",
+                         "fix": f"CLAUDE.md is not readable ({e}) — fix the path/permissions, then memory-init --install"})
+        text = None
+    inner = "@~/.claudemods/shared-memory/MEMORY.md\n@~/.claudemods/shared-memory/MEMORY.local.md"
+    if text is None:
+        pass  # unreadable — reported above; skip the import-block state analysis
+    elif BEGIN not in text:
+        findings.append({"import_block": "absent", "fix": "memory-init --install"})
+    elif END not in text:
+        findings.append({"import_block": "orphaned-begin",
+                         "fix": "remove the stray begin sentinel by hand (--install can't)"})
+    else:
+        # EXACT content compare, not substring: a suffix-mangled dead path (…/MEMORY.md-DISABLED
+        # still *contains* …/MEMORY.md), a comment-prefixed line, or an injected extra @import all
+        # keep the canonical strings as substrings — so a substring test would report "intact" while
+        # recall is dead. Require the between-sentinels lines to be EXACTLY the canonical block.
+        between = text.partition(BEGIN)[2].partition(END)[0]
+        want = [ln.strip() for ln in inner.splitlines() if ln.strip()]
+        got = [ln.strip() for ln in between.splitlines() if ln.strip()]
+        if got != want:
+            findings.append({"import_block": "block-modified", "between": got,
+                             "fix": "re-wire by hand or --uninstall then --install (--install alone won't repair it)"})
+    # --- settings.json owned rules (literal compare; never normalize //→/) ---
+    data = load_settings()
+    live = data.get("permissions", {})
+    for kind, rules in (("allow", ALLOW), ("ask", ASK)):
+        have = live.get(kind, [])
+        missing = [r for r in rules if r not in have]
+        if missing:
+            findings.append({"settings": kind, "missing": missing, "fix": "memory-init --install"})
+        # stale RETIRED rules still present → the CLI warns about them every session (append-only
+        # --install used to miss this; wiring-drift is the signal that closes that blind spot)
+        stale = [r for r in have if r in RETIRED_ALLOW]
+        if stale:
+            findings.append({"settings": kind, "stale_retired": stale,
+                             "fix": "memory-init --install (strips retired rules)"})
+    status = "fail" if findings else "ok"
+    detail = "wiring intact" if status == "ok" else f"{len(findings)} drift item(s)"
+    return _chk("wiring-drift", status, detail, findings)
+
+
+def plugin_appears_enabled():
+    """Best-effort (config-only): True if shared-memory looks enabled at user OR project scope.
+    isinstance-guard every level ([6]) — a foreign/future-format settings.json yields False, not a
+    traceback. Shared by check_plugin_health and uninstall()'s still-enabled warning ([R9] H-uninstall)."""
+    def _en(cfg):
+        ep = cfg.get("enabledPlugins") if isinstance(cfg, dict) else None
+        return isinstance(ep, dict) and ep.get(PLUGIN_ID) is True
+    return (_en(_read_json(SETTINGS))
+            or _en(_read_json(os.path.join(os.getcwd(), ".claude", "settings.json"))))
+
+
+def check_plugin_health():
+    """The gap M2 hit: a green doctor coexisting with capture/eval/reflect dead because the
+    ENABLED build is a frozen snapshot without hooks/. Assert the plugin is enabled, the
+    installed build matches the marketplace source, and the installed build carries hooks/."""
+    findings, caveats = [], ["read from config files; can't confirm the running session loaded them"]
+    # enabled at user OR project scope (isinstance-guarded — a foreign/future-format settings.json
+    # must yield a finding, not a traceback). Shared with uninstall()'s still-enabled warning ([R9]).
+    enabled = plugin_appears_enabled()
+    if not enabled:
+        findings.append({"plugin": "not enabled", "fix": f"enable {PLUGIN_ID} (user or project settings)"})
+    # installed build version + hooks presence
+    pj = _read_json(os.path.join(PLUGINS, "installed_plugins.json"))
+    plugins = pj.get("plugins") if isinstance(pj, dict) else None
+    installed = plugins.get(PLUGIN_ID) if isinstance(plugins, dict) else None
+    rec = installed[0] if isinstance(installed, list) and installed and isinstance(installed[0], dict) else None
+    inst_ver, inst_path = None, None
+    if rec:
+        inst_ver = rec.get("version")
+        inst_path = rec.get("installPath")
+        if not inst_path:
+            findings.append({"build": inst_ver, "hooks": "unverifiable",
+                             "fix": "installed record has no installPath — can't confirm hooks are present"})
+        elif not os.path.exists(os.path.join(inst_path, "hooks", "hooks.json")):
+            findings.append({"build": inst_ver, "hooks": "absent",
+                             "fix": "the enabled build predates the capture/eval/reflect hooks — run `claude plugin update`"})
+        else:
+            # read the installed hooks.json CONTENT: a stale build can have a hooks.json that
+            # lacks the M4 SessionStart→load-recall entry, so existence isn't enough — domain
+            # recall would be silently off while every existence check passes.
+            # isinstance-guard every level: a stale/foreign build can be valid JSON of the
+            # wrong SHAPE (hooks a list, SessionStart a dict, a group whose hooks is a string).
+            # Walk it defensively so an unwalkable shape becomes the same clean "missing" fail,
+            # never an AttributeError that tracebacks the whole doctor pass + the install tail.
+            hj = _read_json(os.path.join(inst_path, "hooks", "hooks.json"))
+            hooks = hj.get("hooks") if isinstance(hj, dict) else None
+            # walk EVERY hook event defensively → all command strings, then require the three
+            # pipeline entry points (G1): a stale build missing capture-candidate or reflect-end
+            # takes capture/reflection dark while every existence check (and the old load-recall-
+            # only check) passed.
+            cmds = []
+            if isinstance(hooks, dict):
+                for groups in hooks.values():
+                    for grp in (groups if isinstance(groups, list) else []):
+                        if isinstance(grp, dict):
+                            for h in (grp.get("hooks") or []):
+                                if isinstance(h, dict):
+                                    cmds.append(h.get("command", ""))
+            # the four pipeline stages (log-recall is telemetry-only, fine to omit): domain recall,
+            # capture, the post-write eval gate, and reflection — a stale build missing any goes dark
+            missing = [s for s in ("load-recall", "capture-candidate", "eval-memory", "reflect-end")
+                       if not any(s in c for c in cmds)]
+            if missing:
+                findings.append({"build": inst_ver, "hooks": f"missing hook entries: {missing}",
+                                 "fix": "the installed build predates part of the pipeline — run `claude plugin update`"})
+    elif enabled:
+        # enabled but no installed build → hooks can't be live; this IS the pipeline-alive question
+        findings.append({"plugin": "enabled but no installed build", "hooks": "unverifiable",
+                         "fix": "no record in installed_plugins.json — reinstall the plugin (`claude plugin install`)"})
+    # installed vs marketplace source (only when the marketplace is a local directory).
+    # isinstance-guard every level ([6]): a foreign/corrupt known_marketplaces.json must yield a
+    # caveat, not traceback the doctor + the offline install-tail (which runs after mutation).
+    mkts = _read_json(os.path.join(PLUGINS, "known_marketplaces.json"))
+    cm = mkts.get("claudemods") if isinstance(mkts, dict) else None
+    src = cm.get("source") if isinstance(cm, dict) else None
+    src = src if isinstance(src, dict) else {}
+    if src.get("source") == "directory" and inst_ver:
+        srcpj = _read_json(os.path.join(src.get("path", ""), "plugins", "shared-memory", ".claude-plugin", "plugin.json"))
+        if srcpj and srcpj.get("version") != inst_ver:
+            findings.append({"installed": inst_ver, "source": srcpj.get("version"),
+                             "fix": "installed build is stale — run `claude plugin update`"})
+    else:
+        caveats.append("marketplace source not a local directory; installed-vs-source not checked")
+    status = "fail" if findings else "ok"
+    detail = f"plugin enabled, build {inst_ver}" if status == "ok" else f"{len(findings)} plugin issue(s)"
+    return _chk("plugin-health", status, detail, findings, caveats)
+
+
+def _project_cwd(transcripts):
+    """Recover a project's real path from a transcript record's `cwd` (exact) — preferred
+    over decoding the dash-encoded dir name (lossy). None if no transcript carries one."""
+    for jf in transcripts[:3]:  # cwd is in the earliest records; a few files cover a resumed dir
+        try:
+            with open(jf, encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    if i > 200:
+                        break
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and rec.get("cwd"):
+                        return rec["cwd"]
+        except OSError:
+            pass
+    return None  # dash-decode is lossy; we don't guess a path we can't verify
+
+
+def check_automemdir_coverage():
+    """NARROWS (does not close) the D3 blind spot. Enumerate projects, recover their real
+    paths, and surface as first-class findings: undecodable projects (force warn), per-project
+    autoMemoryDirectory overrides (capture is blind to them by design; scan/apply honor only
+    user scope), and a user-scope override resolving under the store (a real scan/apply
+    mismatch). Never asserts the three scope computations are equal — capture's regex ignores
+    overrides by design, with the glob as its backstop."""
+    findings = []
+    caveats = ["project-scope overrides need workspace-trust acceptance (unreadable here)",
+               "--settings per-session scope is unwalkable",
+               "capture is override-blind by design; the periodic glob is its backstop"]
+    proj_root = os.path.join(CLAUDE, "projects")
+    undecodable = 0
+    for enc in sorted(glob.glob(os.path.join(proj_root, "*"))):
+        if not os.path.isdir(enc):
+            continue
+        transcripts = sorted(glob.glob(os.path.join(enc, "*.jsonl")))
+        if not transcripts:
+            continue  # inert project dir (no session history) — nothing to cover, don't flag
+        cwd = _project_cwd(transcripts)
+        if cwd is None or not os.path.isdir(cwd):
+            # unrecoverable, OR recovered to a cwd that no longer exists — either way its
+            # per-project settings can't be read, so the override state is unknown → force warn
+            # (a recovered-but-absent cwd reads {} for settings, indistinguishable from "no override")
+            undecodable += 1
+            why = "path unrecoverable — dash-decode is lossy" if cwd is None else f"recovered cwd no longer exists ({cwd})"
+            findings.append({"project": os.path.basename(enc),
+                             "issue": f"active project (has transcripts) but uninspectable — {why}"})
+            continue
+        # per-project / local override → the D3 blind spot (capture + user-scope-only scan/apply can't follow)
+        for scope in ("settings.json", "settings.local.json"):
+            s = _read_json(os.path.join(cwd, ".claude", scope)) or {}
+            override = s.get("autoMemoryDirectory")
+            if override:
+                findings.append({"project": cwd, "scope": scope, "autoMemoryDirectory": override,
+                                 "issue": "per-project override — capture blind to it; scan/apply follow only user scope (D3)"})
+    # user-scope override resolving under the store → memory_dirs ingests it, project_memory_roots rejects it
+    user_override = (_read_json(SETTINGS) or {}).get("autoMemoryDirectory")
+    if user_override:
+        p = os.path.realpath(os.path.expanduser(user_override))
+        if p == os.path.realpath(STORE) or p.startswith(os.path.realpath(STORE) + os.sep):
+            findings.append({"scope": "user", "autoMemoryDirectory": user_override,
+                             "issue": "resolves under the store — scan would ingest it as candidates, apply rejects it (mismatch)"})
+    # force warn (never ok) whenever a project couldn't be inspected — the residual blind spot must be visible
+    if undecodable:
+        status, detail = "warn", f"{undecodable} project(s) uninspectable; {len(findings)} finding(s) — coverage NARROWED, not closed"
+    elif findings:
+        status, detail = "warn", f"{len(findings)} coverage finding(s)"
+    else:
+        status, detail = "ok", "all projects inspected; no override blind spots"
+    return _chk("automemdir-coverage", status, detail, findings, caveats)
+
+
+def check_version_drift():
+    cur = cli_version()
+    if cur is None:
+        return _chk("version-drift", "skip", "could not read `claude --version`")
+    stamp = _read_json(STAMP)
+    if not stamp or not stamp.get("passed_versions"):
+        return _chk("version-drift", "skip", "no probe stamp — run `recall-probes.sh doctor-recall` to record one",
+                    caveats=["stamp certifies only what the probes exercise (recall load + capture enqueue)"])
+    passed = stamp["passed_versions"]
+    if cur in passed:
+        return _chk("version-drift", "ok", f"probes passed on current CLI {cur}")
+    return _chk("version-drift", "warn", f"CLI {cur} not in the probe-passed set {passed} — re-run the probes",
+                findings=[{"current": cur, "passed_versions": passed}],
+                caveats=["certifies recall/capture only — NOT the if-field (≥2.1.85) or SessionEnd budget"])
+
+
+def check_ignore():
+    """Remote-backed stores only: every machine-local path must be gitignored AND untracked,
+    or a sweep `git add` would stage personal memory into the shared remote."""
+    git = shutil.which("git")
+    if not git or not os.path.isdir(os.path.join(STORE, ".git")):
+        return _chk("check-ignore", "skip", "solo store (no git) — nothing to confine")
+    try:
+        remotes = subprocess.run([git, "-C", STORE, "remote"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        remotes = ""
+    if not remotes:
+        return _chk("check-ignore", "skip", "store has no remote — nothing to confine")
+    findings = []
+    for rel in INVENTORY:
+        # `git check-ignore` matches a directory-only pattern (`local/`, `.reflect/`) only
+        # against a path that HAS the trailing slash — and a bare dir name that doesn't exist
+        # yet (`.reflect/` before reflect-end first runs; `local/` on a fresh clone) returns
+        # "not ignored", a false breach. Probe a synthetic child of a directory entry so the
+        # pattern matches whether or not the dir exists; keep the bare name for ls-files.
+        # a glob entry (MEMORY.local.*.md): check-ignore won't expand the literal `*`, so probe a
+        # synthetic concrete instance; ls-files DOES expand it as a pathspec, so track on the glob.
+        is_glob = "*" in rel
+        is_dir = rel.endswith("/")
+        if is_glob:
+            ignore_probe, track_probe = rel.replace("*", "smprobe"), rel
+        elif is_dir:
+            ignore_probe, track_probe = rel + "x", rel.rstrip("/")
+        else:
+            ignore_probe = track_probe = rel
+        ignored = subprocess.run([git, "-C", STORE, "check-ignore", "-q", ignore_probe]).returncode == 0
+        tracked = subprocess.run([git, "-C", STORE, "ls-files", "--error-unmatch", track_probe],
+                                 capture_output=True).returncode == 0
+        if tracked:
+            findings.append({"path": rel, "issue": "TRACKED on a remote-backed store — rides into every clone"})
+        elif not ignored:
+            findings.append({"path": rel, "issue": "not gitignored — a sweep `git add` would stage it"})
+    status = "fail" if findings else "ok"
+    detail = "machine-local layer confined" if status == "ok" else f"{len(findings)} confinement breach(es)"
+    return _chk("check-ignore", status, detail, findings)
+
+
+def check_projection_integrity():
+    """M4: the domain projections must stay in sync with the bodies (every domain-tagged memory
+    in each of its projections, none in the flat index, no orphan projection line). Delegates to
+    gen-projections --check, which reads a snapshot under the store lock (so it can't observe a
+    half-written generate) and returns exit 4 if the lock is held — a generate in flight — which
+    we map to 'skip', not drift. [R9] H-drift: a real drift (exit 3) is a FAIL (was 'warn'), so
+    `--doctor` exits 2 and CI/pre-commit catches an apply that mutated a domain body without
+    regenerating its projection — the stale line keeps steering recall until someone regenerates."""
+    gen = os.path.join(HERE, "gen-projections")
+    if not os.path.exists(gen):
+        return _chk("projection-integrity", "skip", "gen-projections not found")
+    try:
+        r = subprocess.run([sys.executable, gen, "--check"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _chk("projection-integrity", "skip", f"could not run gen-projections --check ({e})")
+    if r.returncode == 0:
+        return _chk("projection-integrity", "ok", "projections in sync with the bodies")
+    if r.returncode == 4:
+        # a generate/backfill/flatten/map is in flight — the check skipped rather than read a
+        # half-written store (run-window exclusion); not drift, so don't warn
+        return _chk("projection-integrity", "skip", "a generate is in flight — drift check deferred")
+    if r.returncode == 3:
+        # [R9] H-drift: real drift is a FAIL so run_doctor exits 2 (catchable in CI/pre-commit)
+        return _chk("projection-integrity", "fail", "projections out of sync — run gen-projections",
+                    findings=[{"gen_check": (r.stdout + r.stderr).strip()[:400]}])
+    return _chk("projection-integrity", "warn", f"gen-projections --check exit {r.returncode}",
+                findings=[{"gen_check": (r.stdout + r.stderr).strip()[:400]}])
+
+
+def check_unmapped_with_projections():
+    """M4: the fresh-clone / second-machine regression. Committed domain projections exist on
+    disk but no repo is mapped in the machine-local .domains.json, so those projections load
+    NOWHERE until the user runs `memory-init --map-repo-add`. Warn (not fail) — it's an
+    onboarding gap, not corruption; per-machine mapping is documented onboarding. Offline."""
+    if not ac.projection_files(STORE):
+        return _chk("unmapped-with-projections", "ok", "no domain projections on disk")
+    if ac.any_repo_mapped(STORE):
+        return _chk("unmapped-with-projections", "ok", "projections present and at least one repo is mapped")
+    return _chk("unmapped-with-projections", "warn",
+                "domain projections exist but no repo is mapped — they load nowhere until "
+                "`memory-init --map-repo-add <domain>` runs (per-machine onboarding)",
+                findings=[{"projections": sorted(ac.projection_files(STORE)), "mapped_repos": 0}])
+
+
+def check_recall_health(run_probe):
+    """Signal 3 / doctor recall-health. The authed headless probe lives in
+    recall-probes.sh (doctor-recall); here we delegate to it when asked, else skip. Kept out
+    of install()-tail and gated by --no-probe so no invocation silently spawns an authed
+    `claude -p`."""
+    if not run_probe:
+        return _chk("recall-health", "skip", "offline run (--no-probe / install-tail); run `memory-init --doctor` for the live probe")
+    probe = os.path.join(os.path.dirname(HERE), "probes", "recall-probes.sh")
+    if not os.path.exists(probe) or not shutil.which("claude"):
+        return _chk("recall-health", "skip", "recall probe or `claude` unavailable")
+    try:
+        r = subprocess.run(["bash", probe, "doctor-recall"], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return _chk("recall-health", "fail", "recall probe timed out")
+    except (OSError, subprocess.SubprocessError) as e:
+        return _chk("recall-health", "skip", f"could not run recall probe: {e}")
+    # the probe emits a final JSON line {status, detail}; parse it, else infer from exit code
+    for line in reversed(r.stdout.splitlines()):
+        obj = None
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("check") == "recall-health":
+            return obj
+    status = "ok" if r.returncode == 0 else "fail"
+    return _chk("recall-health", status, f"recall probe exit {r.returncode}")
+
+
+def doctor(run_probe=True, offline_only=False):
+    """Run the health pass. offline_only (install-tail) runs the cheap checks only."""
+    check_settings_parseable()  # malformed settings → clean fail, not a traceback
+    checks = [check_wiring_drift(), check_plugin_health(), check_automemdir_coverage(),
+              check_projection_integrity(), check_unmapped_with_projections()]
+    if not offline_only:
+        checks.append(check_recall_health(run_probe))
+        checks.append(check_version_drift())
+    checks.append(check_ignore())
+    # cli_version shells out to `claude`; skip it on the offline (install-tail) path so install
+    # never spawns claude at all — the field isn't used there anyway.
+    return {"version": 1, "store": STORE,
+            "cli_version": None if offline_only else cli_version(), "checks": checks}
+
+
+def run_doctor(run_probe=True):
+    report = doctor(run_probe=run_probe)
+    print(json.dumps(report, indent=2))
+    return 2 if any(c["status"] == "fail" for c in report["checks"]) else 0
+
+
+def install():
+    check_settings_parseable()
+    check_claudemd_readable()   # [7]: catch a bad CLAUDE.md before seed_store/wire_settings mutate
+    print(f"memory-init: store at {STORE}; wiring under {CLAUDE}\n")
+    os.makedirs(CLAUDE, exist_ok=True)  # store moved out of ~/.claude, so seeding no longer creates it
+    seed_store()
+    wire_settings()  # rules before imports: recall goes live already covered by the read-allow
+    wire_imports()
+    print("\ndone. New sessions will load the shared index; the plugin's skills are already live.")
+    # converge on the doctor pass: run the cheap (offline) checks and report. The
+    # cost-bearing authed recall probe + version stamp are NOT run here (never spawn
+    # `claude -p` from install) — that's `memory-init --doctor`. Only `wiring-drift`
+    # gates install's exit code, because that is the state --install OWNS and just wrote;
+    # the others (plugin enablement, coverage, check-ignore) are prerequisites/observations
+    # outside init's lane — surfaced so the user sees them, but they don't fail the install.
+    report = doctor(offline_only=True)
+    notable = [c for c in report["checks"] if c["status"] in ("fail", "warn")]
+    if notable:
+        print("\ndoctor (install-tail):")
+        print(json.dumps(notable, indent=2))
+    return 2 if any(c["check"] == "wiring-drift" and c["status"] == "fail" for c in report["checks"]) else 0
+
+
+def uninstall():
+    check_settings_parseable()
+    check_claudemd_readable()   # [7]: a bad CLAUDE.md would traceback unwire_imports' read
+    print(f"memory-init: uninstall from {CLAUDE}\n")
+    unwire_imports()
+    unwire_settings()
+    print("\ndone — wiring removed (@import block + settings rules).")
+    # [R9] H-uninstall (a)+(c): --uninstall is WIRING-ONLY. The plugin's own hooks live under
+    # ${CLAUDE_PLUGIN_ROOT} (a marketplace-layer mechanism memory-init has no handle on), so they
+    # keep firing until the plugin is disabled. Make the two-step teardown explicit, and warn when
+    # the plugin still looks enabled so the partial-teardown state isn't a surprise.
+    if plugin_appears_enabled():
+        print(f"\nNOTE: the {PLUGIN_ID} plugin still appears ENABLED — its capture / eval / recall /"
+              " reflect hooks stay live until you disable the plugin.")
+    print("\nTo fully remove shared-memory:\n"
+          "  1. disable/uninstall the plugin (stops the hooks)\n"
+          f"  2. optionally delete the store:  rm -rf {STORE}")
+    print(f"\nThe store at {STORE} — your memories, the machine-local .domains.json, and the "
+          "generated projections — and the *.smbak.* backups are left in place: your memories are "
+          "yours. Delete them by hand (step 2) if you want them gone.")
+
+
+# ---- the repo→domain map (M4): --list-domains / --map-repo ---------------------------
+
+def _parse_domains(v):
+    v = (v or "").strip()
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    return [x.strip().strip('"').strip("'") for x in v.split(",") if x.strip()]
+
+
+def domain_universe():
+    """Every domain that appears as a tag on any live memory body — the set a repo may map to
+    (works pre-generate, since it reads tags, not projection files)."""
+    doms = set()
+    for d in (STORE, os.path.join(STORE, "local")):
+        for p in glob.glob(os.path.join(d, "*.md")):
+            base = os.path.basename(p)
+            if base.startswith(".") or base == "RETIRED.md" or ac.INDEX_RE.match(base):
+                continue
+            try:
+                with open(p, encoding="utf-8") as f:
+                    fields, _ = ac.parse_frontmatter(f.read())
+            except OSError:
+                continue
+            for dom in _parse_domains((fields or {}).get("domains", "")):
+                doms.add(dom)
+    return sorted(doms)
+
+
+def list_domains():
+    u = domain_universe()
+    print("\n".join(u) if u else "(no domain-tagged memories yet)")
+    return 0
+
+
+def map_repo(domains, additive=False):
+    """Set (or, with additive=True, extend) the CURRENT repo's domain set in .domains.json
+    (machine-local). Keyed by the same repo_root() the loader reads with, so a subdir/worktree
+    maps consistently. Domains are validated against the tag universe so a typo can't map to a
+    nonexistent domain. --map-repo REPLACES the whole set (a deliberate reset); --map-repo-add
+    unions in the named domains, keeping the repo's existing ones — the safe default for adding
+    one domain during distill."""
+    flag = "--map-repo-add" if additive else "--map-repo"
+    if not domains:
+        sys.exit(f"memory-init {flag} <domain>...: name one or more domains (see --list-domains)")
+    universe = set(domain_universe())
+    errs = []
+    for d in domains:
+        if not re.match(r"^[A-Za-z0-9_-]+$", d) or d in RESERVED_DOMAINS:
+            errs.append(f"{d!r}: invalid domain name (must match [A-Za-z0-9_-], not 'local')")
+        elif d not in universe:
+            errs.append(f"{d!r}: no memory carries this domain tag — typo? known: {sorted(universe) or '(none)'}")
+    if errs:
+        sys.exit(f"memory-init {flag} refused:\n  " + "\n  ".join(errs))
+    key = ac.repo_root(os.getcwd())
+    # take the shared store lock around the read-modify-write, like the apply scripts, so a
+    # concurrent --map-repo of a different repo can't lose an entry
+    try:
+        fd = ac.acquire_lock(os.path.join(STORE, ".distill.lock"))
+    except ac.LockHeld:
+        sys.exit("memory-init --map-repo: store lock held — another batch in flight; retry")
+    try:
+        try:
+            m = json.load(open(DOMAINS_MAP)) if os.path.exists(DOMAINS_MAP) else {}
+        except ValueError:
+            sys.exit(f"memory-init: {DOMAINS_MAP} is not valid JSON; fix it and re-run — nothing changed")
+        if not isinstance(m, dict):
+            m = {}
+        m.setdefault("version", 1)
+        if not isinstance(m.get("repos"), dict):   # a corrupt non-dict `repos` → clean reset, not a traceback
+            m["repos"] = {}
+        prior = m["repos"].get(key)
+        prior = set(prior) if (additive and isinstance(prior, list)) else set()
+        result = sorted(prior | set(domains))
+        m["repos"][key] = result
+        tmp = DOMAINS_MAP + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f, indent=1)
+        os.replace(tmp, DOMAINS_MAP)
+    finally:
+        ac.release_lock(fd, os.path.join(STORE, ".distill.lock"))
+    print(f"memory-init: mapped repo {key} → {result}")
+    return 0
+
+
+def main(argv):
+    args = argv[1:]
+    arg = args[0] if args else "--install"
+    if arg in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if arg == "--uninstall":
+        uninstall()
+        return 0
+    if arg in ("--install", ""):
+        return install()
+    if arg == "--doctor":
+        # --doctor runs the full pass incl. the authed recall probe; --doctor --no-probe
+        # runs the offline checks only (fast, CI-safe — no `claude -p` spawned).
+        return run_doctor(run_probe="--no-probe" not in args)
+    if arg == "--list-domains":
+        return list_domains()
+    if arg == "--map-repo":
+        return map_repo(args[1:])
+    if arg == "--map-repo-add":
+        return map_repo(args[1:], additive=True)
+    if arg == "--remote":
+        print("memory-init: --remote is planned, not yet implemented — solo install/uninstall only for now", file=sys.stderr)
+        return 2
+    print(f"memory-init: unknown argument {arg!r} (try --help)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

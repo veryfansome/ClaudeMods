@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""eval-memory: PostToolUse (Write|Edit) handler on the shared store — the behind-the-
+scenes half of the surface-and-heal pair. When a belief lands, check it against the store
+and surface a note if it lacks a `basis` field or looks like a near-duplicate of an
+existing memory, so a new learning is examined the moment it's saved, not three reviews
+later.
+
+NON-BLOCKING ("Inform, don't gate"): never emits a `decision` or `updatedToolOutput`, so
+the write always stands; a flagged conflict is corrected in conversation or quarantined.
+Fail-soft: a non-memory path, a malformed payload, or any I/O error is a silent exit 0 —
+plumbing never blocks or errors a session, and on the hook's short timeout it no-ops.
+
+A conflict is surfaced on TWO channels:
+  - top-level `systemMessage` — user-visible, so surfacing the flag does not depend on
+    Claude relaying it;
+  - `hookSpecificOutput.additionalContext` (with `hookEventName`, both required or the
+    context isn't injected) — Claude-facing, read on the next model request, which is the
+    same-turn continuation because this hook is synchronous.
+"""
+import difflib
+import json
+import os
+import re
+import sys
+
+HOME = os.path.expanduser("~")
+STORE = os.path.join(HOME, ".claudemods", "shared-memory")
+LOCAL = os.path.join(STORE, "local")
+
+# Chosen from the live store's own similarity distribution: distinct memories peak at
+# ~0.42 pairwise similarity, so 0.6 leaves a clear band with no false positives while
+# still catching a genuine restatement (which scores far higher). Deliberately stricter
+# than review-scan's 0.45 advisory floor — this note fires deterministically in-turn, so
+# a false positive trains the collaborator to ignore the one surface kept after the gate.
+NEAR_DUP_FLOOR = 0.6
+
+LINE_RE = re.compile(r"^- \[(?P<title>[^\]]*)\]\((?P<link>[^)]+)\)(?:\s+—\s+(?P<desc>.*))?$")
+
+# reach the sibling bin/ for the shared, block-list-aware frontmatter parser + the one INDEX_RE
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin"))
+import _apply_common as ac  # noqa: E402
+INDEX_RE = ac.INDEX_RE   # centralized (M4) — same definition is_memory_file uses (no intra-file divergence)
+
+
+def norm(s):
+    return re.sub(r"\s+", " ", (s or "").strip().casefold()).rstrip(" .:;—-")
+
+
+def parse_list(v):
+    """Inline frontmatter list value -> [names] (block lists are pre-folded to inline
+    form by ac.parse_frontmatter)."""
+    v = (v or "").strip()
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    return [x.strip().strip('"').strip("'") for x in v.split(",") if x.strip()]
+
+
+is_memory_file = ac.is_memory_file  # shared with log-recall; one body/index boundary
+
+
+def index_paths():
+    try:
+        names = os.listdir(STORE)
+    except OSError:
+        return []
+    return [os.path.join(STORE, n) for n in sorted(names) if INDEX_RE.match(n)]
+
+
+def live_memories():
+    """(name, description, abspath) for every memory an index links — read from the body
+    (mirrors review-scan), so the near-dup key matches on real name+description."""
+    out = []
+    for ip in index_paths():
+        base = os.path.dirname(ip)
+        try:
+            text = open(ip, encoding="utf-8").read()
+        except (OSError, UnicodeError):
+            continue   # a non-UTF-8 index must not crash the eval hook on every write ([17]/M4)
+        for raw in text.splitlines():
+            m = LINE_RE.match(raw.strip())
+            if not m:
+                continue
+            body = os.path.join(base, m.group("link"))
+            try:
+                fields, _ = ac.parse_frontmatter(open(body, encoding="utf-8").read())
+            except (OSError, UnicodeError):
+                continue  # dangling link OR a non-UTF-8 byte — skip, never crash the hook ([17]/M4)
+            fields = fields or {}
+            name = fields.get("name") or os.path.splitext(os.path.basename(body))[0].replace("_", "-")
+            out.append((name, fields.get("description", ""), body,
+                        set(parse_list(fields.get("cites", ""))),
+                        set(parse_list(fields.get("supersedes", "")))))
+    return out
+
+
+def evaluate(p):
+    """Return the list of note strings for the memory at abspath p (empty = clean)."""
+    try:
+        fields, _ = ac.parse_frontmatter(open(p, encoding="utf-8").read())
+    except (OSError, UnicodeError):
+        return []   # the just-written file is unreadable/non-UTF-8 → skip, exit 0 (M4)
+    fields = fields or {}
+    name = fields.get("name") or os.path.splitext(os.path.basename(p))[0].replace("_", "-")
+    self_key = norm(name + " " + fields.get("description", ""))
+    cites = set(parse_list(fields.get("cites", "")))
+    supersedes = set(parse_list(fields.get("supersedes", "")))
+    notes = []
+
+    # 1. missing basis (doctrine is exempt — its standing is adoption, basis in a comment)
+    if not fields.get("basis") and fields.get("doctrine") != "true":
+        notes.append(f"'{name}' was saved with no `basis` — a memory needs verified / "
+                     f"observed / contradicted grounding, or it isn't a memory.")
+
+    # 2. near-duplicate against the live index, excluding the memory's own entry (so a
+    #    clean edit isn't a self-dup) and any match it deliberately cites (antenna) or
+    #    supersedes (consolidation) — both are design moves, not accidental duplicates.
+    target = os.path.realpath(p)
+    best = None
+    for other_name, other_desc, other_body, other_cites, other_supersedes in live_memories():
+        if os.path.realpath(other_body) == target:
+            continue
+        # skip a DELIBERATE link in EITHER direction ([10]): we cite/supersede it, OR it cites/
+        # supersedes us — otherwise editing a memory cited by an antenna flags it as its own near-dup
+        if (other_name in cites or other_name in supersedes
+                or name in other_cites or name in other_supersedes):
+            continue
+        ratio = difflib.SequenceMatcher(None, self_key, norm(other_name + " " + other_desc)).ratio()
+        if best is None or ratio > best[0]:
+            best = (ratio, other_name)
+    if best and best[0] >= NEAR_DUP_FLOOR:
+        notes.append(f"'{name}' looks like a near-duplicate of '{best[1]}' (similarity "
+                     f"{best[0]:.2f}) — duplicate, contradiction, or should one cite the "
+                     f"other? Examine it before it dilutes the store.")
+    return notes
+
+
+def main():
+    try:
+        path = (json.load(sys.stdin).get("tool_input") or {}).get("file_path", "")
+    except Exception:
+        return 0  # malformed payload → silent no-op
+    if not path or not is_memory_file(path):
+        return 0
+    notes = evaluate(os.path.abspath(path))
+    if not notes:
+        return 0  # clean → silent
+    msg = " ".join(notes)
+    print(json.dumps({
+        "systemMessage": "shared-memory: " + msg,
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "shared-memory eval — " + msg,
+        },
+    }))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

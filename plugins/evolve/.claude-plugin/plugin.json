@@ -1,0 +1,6 @@
+{
+  "name": "evolve",
+  "description": "ShinkaEvolve-inspired evolutionary search for any project: inventor agents propose candidates over a marked code region or a chunk registry, a deterministic engine owns selection — archive, weighted parent sampling, novelty dedup, pristine-clone scoring, noise-floored promotion, budget and holdout firewalls",
+  "version": "0.2.0",
+  "repository": "https://github.com/veryfansome/claudemods"
+}

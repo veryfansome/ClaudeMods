@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""load-recall: SessionStart handler — the domain tier of M4's hybrid recall.
+
+The always-load tier (general MEMORY.md + personal MEMORY.local.md, both []-tagged) rides the
+static @import in ~/.claude/CLAUDE.md (inherited by subagents). This hook adds the DOMAIN tier:
+it reads the session's cwd, resolves the repo, looks up the repo's domains in .domains.json,
+and injects the matching MEMORY.<domain>.md / MEMORY.local.<domain>.md projection lines as
+`additionalContext` (parent-session-only; not inherited by subagents — a parent passes domain
+specifics into a subagent's task, see the README).
+
+Fail-soft but never SILENT when a domain was expected:
+  * unmapped repo (no .domains.json entry) → inject nothing; general-only. Correct + silent.
+  * scheduling/parse/cwd error → inject nothing; degrade quietly.
+  * a MAPPED domain whose projection is missing/unreadable, or dropped for budget → inject what
+    fits AND an in-band `[shared-memory: domain <x> …]` note (P9: we do NOT rely on a SessionStart
+    systemMessage rendering; the note rides inside additionalContext, which P4 proved reaches the
+    model). A mapped domain vanishing silently is the false-negative M4 must avoid.
+
+Any exception → exit 0 with no injection. This is recall, not a gate; it must never block a launch.
+"""
+import json
+import os
+import re
+import sys
+
+DOMAIN_RE = re.compile(r"^[A-Za-z0-9_-]+$")  # ASCII slug; reject anything that could escape the path
+RESERVED_DOMAINS = {"local"}         # 'local' would read the flat personal index MEMORY.local.md
+                                     # as if it were a projection (double-load) — never a domain
+
+HOME = os.path.expanduser("~")
+STORE = os.path.join(HOME, ".claudemods", "shared-memory")
+BUDGET = 10000  # conservative additionalContext char cap; whole-projection drop order (P6: exact
+                # cap is a scale-time probe — the store's domain content is far under this today)
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin"))
+import _apply_common as ac  # noqa: E402
+
+
+def projection_lines(base):
+    """The index lines of a projection file (header + blanks stripped), or None if absent."""
+    p = os.path.join(STORE, base)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return [ln for ln in f.read().splitlines() if ln.startswith("- ")]
+    except (OSError, UnicodeError):
+        return None   # a non-UTF-8 projection reads as missing → the mapped-but-no-projection note fires ([17])
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    cwd = payload.get("cwd") or os.getcwd()
+    try:
+        domains = ac.repo_domains(cwd)
+    except Exception:
+        return 0
+    # filter to valid string slugs ONCE ([14]): a non-string / malformed / reserved domain in a
+    # corrupt .domains.json must not TypeError render()'s header (', '.join over the raw list) —
+    # exit-0-silent is the contract. Both the loop below and render() now see clean data.
+    domains = [d for d in domains if isinstance(d, str) and DOMAIN_RE.match(d) and d not in RESERVED_DOMAINS]
+    if not domains:
+        # unmapped repo → general-only (the @import tier); normally silent. The exception is the
+        # fresh-clone / second-machine state — committed projections on disk but NO repo mapped —
+        # where every repo silently loads its projections nowhere. Surface a one-line onboarding
+        # hint until the first `--map-repo-add` populates the map, then fall silent everywhere.
+        try:
+            fresh_clone = ac.unmapped_with_projections(STORE)
+        except Exception:
+            fresh_clone = False
+        if fresh_clone:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                "additionalContext": "[shared-memory: this store has domain projections but no repo "
+                "is mapped on this machine yet — run `memory-init --map-repo-add <domain>` in a repo "
+                "to load its domain memories here]"}}))
+        return 0
+
+    # collect each mapped domain's lines (general + personal projections), dedup, note the gaps
+    sections, notes, seen = [], [], set()
+    for dom in domains:
+        if not isinstance(dom, str) or not DOMAIN_RE.match(dom) or dom in RESERVED_DOMAINS:
+            continue  # malformed or reserved ('local') → can't/shouldn't index a projection — skip
+        got = []
+        missing = True
+        for base in (f"MEMORY.{dom}.md", f"MEMORY.local.{dom}.md"):
+            lines = projection_lines(base)
+            if lines is None:
+                continue
+            missing = False
+            for ln in lines:
+                if ln not in seen:
+                    seen.add(ln)
+                    got.append(ln)
+        if missing:
+            # mapped but no projection backs it (typo / not-yet-generated / stale) — surface it
+            notes.append(f"domain '{dom}' is mapped but has no projection")
+        elif got:
+            sections.append((dom, got))
+
+    # budget: drop whole domain sections (lowest-priority last) until under the cap; note drops
+    def render(secs, extra_notes):
+        parts = [f"# shared-memory — domain recall for this repo ({', '.join(domains)})"]
+        for dom, lines in secs:
+            parts.append(f"## {dom}")
+            parts.extend(lines)
+        for n in extra_notes:
+            parts.append(f"[shared-memory: {n}]")
+        return "\n".join(parts)
+
+    dropped = list(notes)
+    while sections and len(render(sections, dropped)) > BUDGET:
+        dom, _ = sections.pop()   # drop the last (deterministic: map order) — visible, not silent
+        dropped.append(f"domain '{dom}' omitted (over budget)")
+
+    if not sections and not dropped:
+        return 0
+    body = render(sections, dropped)
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": body,
+    }}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

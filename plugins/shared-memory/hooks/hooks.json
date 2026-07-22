@@ -1,0 +1,35 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/capture-candidate", "args": [], "async": true, "if": "Write(~/.claude/projects/**/memory/**)" },
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/capture-candidate", "args": [], "async": true, "if": "Edit(~/.claude/projects/**/memory/**)" },
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/eval-memory", "args": [], "timeout": 5, "if": "Write(~/.claudemods/shared-memory/**)" },
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/eval-memory", "args": [], "timeout": 5, "if": "Edit(~/.claudemods/shared-memory/**)" }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/log-recall", "args": [], "async": true, "if": "Read(~/.claudemods/shared-memory/**)" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/load-recall", "args": [] }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/reflect-end", "args": [] }
+        ]
+      }
+    ]
+  }
+}

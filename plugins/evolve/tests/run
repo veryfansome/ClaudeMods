@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Deterministic tests for the evolve plugin — no model calls, no network, CI-ready.
+set -u
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 required to run these tests (and to run the plugin itself)" >&2
+  exit 2
+fi
+if ! command -v git >/dev/null 2>&1; then
+  echo "git required (candidates are scored from HEAD in pristine clones)" >&2
+  exit 2
+fi
+cd "$(dirname "$0")/.."   # plugin root
+exec python3 -m unittest discover -s tests -p 'test_*.py' "$@"
