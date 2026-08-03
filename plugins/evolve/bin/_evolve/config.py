@@ -7,6 +7,7 @@ a training run.
 """
 
 import copy
+import math
 import json
 import pathlib
 
@@ -35,14 +36,22 @@ DEFAULTS = {
     "fitness": {"noise_floor": None, "noise_runs": 5, "noise_meta": None,
                 "selection_env": None, "env_offsets": {}},
     "search": {
-        "lambda": 10.0,
+        # λ is in units of 1/fitness: a fixed value silently goes inert on the wrong scale
+        # (a margin-scale search measured 8 rounds of uniform parent sampling under the old
+        # fixed 10.0). "auto" derives 2.5/scale(F) at sample time — robust scale, floored at
+        # the measured noise floor, so it is scale-free and does not amplify eval noise.
+        "lambda": "auto",
         "inspirations": {"archive": 2, "top_k": 2},
         "op_probs": {"diff": 0.5, "rewrite": 0.4, "cross": 0.1},
         "dedup_similarity": 0.95,
         "insights_interval": 8,
         "standing_rules": [],
     },
-    "budget": {"max_generations": 40, "max_full_evals": 15, "stop_after_stale_rounds": 6},
+    # Engine stop conditions are opt-in: an absent/empty block is UNLIMITED (stopping is the
+    # owner's call). Non-empty defaults here would mean deleting the block from a project
+    # config silently re-imposes limits — a knob that can't be turned off by removal.
+    # The init template writes explicit caps, so scaffolded projects still start bounded.
+    "budget": {},
 }
 
 
@@ -116,6 +125,22 @@ def validate(cfg, root=None):
         unknown = [a for a in req if a not in reg["axes"]]
         if unknown:
             raise ConfigError(f"registry.required names unknown axes: {unknown}")
+        inv = reg.get("inventor_files")
+        if inv is not None:
+            if not isinstance(inv, list) or not all(isinstance(x, str) and x for x in inv):
+                raise ConfigError("surface.registry.inventor_files must be a list of repo-relative "
+                                  "paths (the harness files an impl may import — measured, not guessed)")
+            for x in inv:
+                px = pathlib.PurePosixPath(x)
+                if px.is_absolute() or ".." in px.parts:
+                    raise ConfigError(f"surface.registry.inventor_files entry {x!r} must be "
+                                      "repo-relative — no absolute paths, no '..' (a stale "
+                                      "absolute path ships the wrong machine's file into "
+                                      "every jail)")
+        if reg.get("jail_notes") is not None and not isinstance(reg["jail_notes"], str):
+            raise ConfigError("surface.registry.jail_notes must be a string — it is delivered "
+                              "through the diet brief, redacted and asserted like all prose "
+                              "(dataset roots, machine budgets, testing instructions)")
 
     ev = cfg["eval"]
     for tier in ("proxy", "full"):
@@ -131,6 +156,16 @@ def validate(cfg, root=None):
     for s in splits:
         if not isinstance(s, str) or not s:
             raise ConfigError("eval.splits entries must be non-empty strings")
+
+    lam = cfg["search"].get("lambda", "auto")
+    if not (lam in (None, "auto")
+            or (isinstance(lam, (int, float)) and not isinstance(lam, bool)
+                and lam >= 0 and math.isfinite(lam))):
+        # json.loads turns both the literal Infinity and an overflowing 1e999 into inf, which
+        # would pass a bare >= 0 check and then crash sampling with a message that never
+        # names this field — fail here, in milliseconds, like the module charter says.
+        raise ConfigError('search.lambda must be "auto" (derive 2.5/scale(F) from the archive), '
+                          'null, or a non-negative finite number — λ is in units of 1/fitness')
 
     probs = cfg["search"]["op_probs"]
     unknown = [o for o in probs if o not in OPERATORS]

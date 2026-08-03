@@ -14,6 +14,7 @@ machinery, dropped — the agent's own edit tools subsume it).
 
 import fnmatch
 import hashlib
+import json
 import pathlib
 import subprocess
 
@@ -273,3 +274,31 @@ def genome_impl_files(genome, root, cfg):
 
 def genome_recipe(genome):
     return ", ".join(f"{a}={s.get('impl')}" for a, s in sorted(genome.get("chunks", {}).items()))
+
+
+def retired_impls(root):
+    """Optional project registry `evolve/retired_impls.json` — impls whose MECHANISM the
+    project has retired (schema: {"retired": {"<axis>/<impl>": {...}}}; extra keys and a
+    top-level "_doc" are tolerated). The engine's reading is deliberately narrow and
+    general: a retired impl is not a live option, so `evolve impls` omits it and briefs
+    never offer a genome selecting one as inspiration — a retired mechanism handed to an
+    inventor as inspiration defeats the retirement. Everything richer (scope semantics,
+    re-measurement rosters, source deletion) stays project-owned. Absent or malformed
+    file = no registry."""
+    p = state_dir(root) / "retired_impls.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+    except (ValueError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}   # a list/string top level is valid JSON but not this registry — no-op
+    retired = data.get("retired")
+    return retired if isinstance(retired, dict) else {}
+
+
+def genome_selects_retired(genome, retired):
+    """True if any axis of the genome selects a retired impl (registry key '<axis>/<impl>')."""
+    return any(f"{axis}/{(spec or {}).get('impl')}" in retired
+               for axis, spec in (genome.get("chunks") or {}).items())

@@ -1,11 +1,13 @@
 {
   "name": "claudemods",
-  "owner": { "name": "veryfansome" },
+  "owner": {
+    "name": "veryfansome"
+  },
   "plugins": [
     {
       "name": "evolve",
       "source": "./plugins/evolve",
-      "description": "ShinkaEvolve-inspired evolutionary search for any project: inventor agents mutate a marked region or chunk registry, a deterministic engine owns selection — archive, weighted sampling, dedup, pristine-clone scoring, noise-floored promotion, holdout firewall"
+      "description": "ShinkaEvolve-inspired evolutionary search for any project: inventor agents propose candidates over a marked code region or a chunk registry, a deterministic engine owns selection \u2014 append-only archive, median-relative weighted parent sampling, novelty dedup, pristine-clone scoring, budget and holdout firewalls. Search accumulates and never crowns: no champion, no promotion, no adoption step \u2014 validity is enforced per-candidate (guardrails at score time, append-only retraction post hoc), and what ships is decided outside the engine"
     },
     {
       "name": "shared-memory",

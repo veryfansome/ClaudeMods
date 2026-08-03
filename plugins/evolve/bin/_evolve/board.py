@@ -5,7 +5,7 @@ biased by an earlier round's editorializing. Budget state comes purely from the 
 so it survives sessions and machines with zero process memory.
 """
 
-from . import archive, prereg
+from . import archive
 from .config import FINAL_SPLIT, DEFAULT_SPLIT
 
 
@@ -31,7 +31,6 @@ def report(root, cfg, top=10):
     sel_env = cfg["fitness"].get("selection_env")
     selection = [r for r in recs if r.get("split", DEFAULT_SPLIT) != FINAL_SPLIT]
     final = [r for r in recs if r.get("split") == FINAL_SPLIT]
-    champ = archive.best(root, sel_env)
     envs = archive.selection_envs(recs)
     commits = sorted({r.get("commit") for r in archive.valid(recs, sel_env) if r.get("commit")})
     warnings = []
@@ -52,18 +51,18 @@ def report(root, cfg, top=10):
              "operator": r.get("operator"), "env": r.get("env"), "rationale": r.get("rationale")}
             for r in archive.leaderboard(root, top, sel_env)
         ],
-        "champion": champ["id"] if champ else None,
         "budget": archive.budget_state(root, cfg["budget"], sel_env),
         "noise_floor": cfg["fitness"].get("noise_floor"),
         "selection_env": sel_env,
         "env_offsets": cfg["fitness"].get("env_offsets") or {},
-        "active_prereg": prereg.active(root),
         "environments": envs,
         "records": {"total": len(recs), "selection_split": len(selection), "final_split": len(final)},
-        "by_inventor": _by(selection, "inventor"),
-        "by_operator": _by(selection, "operator"),
+        # Retraction records are bookkeeping, not runs — counting them as "failed" would skew
+        # the guardrail-failure-rate signal the status skill reads for eval/brief health.
+        "by_inventor": _by([r for r in selection if not r.get("retract")], "inventor"),
+        "by_operator": _by([r for r in selection if not r.get("retract")], "operator"),
         "final_split_runs": [
-            {"id": r["id"], "fitness": r.get("fitness"), "mode": r.get("mode"), "env": r.get("env")}
+            {"id": r.get("id"), "fitness": r.get("fitness"), "mode": r.get("mode"), "env": r.get("env")}
             for r in final
         ],
         "warnings": warnings,
@@ -83,19 +82,17 @@ def render(rep):
                      f"{r['id']:26s}  [{r.get('inventor') or '?'}/{r.get('operator') or '?'}]  "
                      f"{(r.get('rationale') or '')[:48]}")
     b = rep["budget"]
-    lines.append(f"\nBUDGET: gen {b['generations']}, full evals {b['full_evals']}, "
-                 f"stale {b['stale_generations']} gens"
-                 + (f" — EXHAUSTED: {'; '.join(b['exhausted'])}" if b["exhausted"] else ""))
-    lines.append(f"noise floor: {rep['noise_floor']}   champion: {rep['champion']}"
+    if b.get("disabled"):
+        lines.append(f"\nCOUNTS: gen {b['generations']}, full evals {b['full_evals']} "
+                     f"(budget disabled — no engine stop conditions)")
+    else:
+        lines.append(f"\nBUDGET: gen {b['generations']}, full evals {b['full_evals']}, "
+                     f"stale {b['stale_generations']} gens"
+                     + (f" — EXHAUSTED: {'; '.join(b['exhausted'])}" if b["exhausted"] else ""))
+    lines.append(f"noise floor: {rep['noise_floor']}"
                  + (f"   selection_env: {rep['selection_env']}" if rep.get("selection_env") else ""))
     for w in rep.get("warnings", []):
         lines.append(f"⚠ {w}")
-    pr = rep.get("active_prereg")
-    if pr:
-        g2 = pr.get("g2") or {}
-        lines.append(f"\nACTIVE PREREG ({pr['round']}): G1 fitness floor ≥ {pr['g1_fitness_floor']} "
-                     f"(sacred, vs champion {pr['champion']['id']}); G2: {g2.get('desc') or '—'}"
-                     + (f" (≥ {g2['threshold']})" if g2.get('threshold') is not None else ""))
     if rep.get("env_offsets"):
         for env, e in rep["env_offsets"].items():
             lines.append(f"env offset [{env}]: {e['offset']:+.4f} vs {e['ref_env']} "

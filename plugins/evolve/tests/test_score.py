@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import subprocess
 import unittest
@@ -95,9 +97,23 @@ class TestScoreMarkers(unittest.TestCase):
         self.assertIsNone(rec["fitness"])                          # recorded failure, no crash
         self.assertIn("patch does not apply", rec["guardrail"])
 
+    def test_retracted_seed_reinstates_via_rescore(self):
+        # valid()'s docstring promises "a later rescore under a fixed eval reinstates the id" —
+        # that must hold for the markers seed too, whose record carries no patch (a retraction
+        # appended after it must not mask the seed-shaped record from rescore's replay).
+        score.score_seed(self.root, self.cfg)
+        score.ingest(self.root, self.cfg,
+                     result_text='{"retract": true, "fitness": null, "guardrail": "eval invalid"}',
+                     meta=meta("gen0-baseline"), mode="proxy", split="inner",
+                     env=score.default_env())
+        self.assertIsNone(archive.best(self.root))
+        rec = score.rescore(self.root, self.cfg, rec_id="gen0-baseline", mode="proxy")
+        self.assertEqual(rec["fitness"], 1.0)
+        self.assertEqual(archive.best(self.root)["id"], "gen0-baseline")   # reinstated
+
     def test_final_split_firewalled(self):
         score.score_seed(self.root, self.cfg)
-        self._candidate(5.0, "champ", split="final")
+        self._candidate(5.0, "fv1", split="final")
         self.assertEqual(archive.best(self.root)["id"], "gen0-baseline")  # final never selects
 
     def test_full_mode_multi_seed(self):
@@ -141,8 +157,8 @@ class TestScoreMarkers(unittest.TestCase):
         self.assertIsNone(rec["fitness"])                          # archived as failure, no crash
         self.assertIn("not valid JSON", rec["guardrail"])
 
-    def test_rescore_promotes_reusing_id(self):
-        self._candidate(2.0, "g1", parent="gen0-baseline")         # proxy
+    def test_rescore_to_full_reuses_id(self):
+        self._candidate(2.0, "g1")                                 # proxy
         full = score.rescore(self.root, self.cfg, rec_id="g1", mode="full")
         self.assertEqual(full["mode"], "full")
         self.assertEqual(full["id"], "g1")
@@ -257,12 +273,48 @@ class TestIngest(unittest.TestCase):
 
     def test_rescore_of_ingested_markers_record_refused(self):
         # An ingested markers record carries only its score, not a patch — rescoring it must
-        # NOT silently score the seed under the champion's id.
+        # NOT silently score the seed under another candidate's id.
         text = json.dumps({"fitness": 0.9}) + "\n"
-        score.ingest(self.root, self.cfg, result_text=text, meta=meta("remoteX", parent="gen0-baseline"),
+        score.ingest(self.root, self.cfg, result_text=text, meta=meta("remoteX"),
                      mode="full", split="inner", env="box")
         with self.assertRaises(ValueError):
             score.rescore(self.root, self.cfg, rec_id="remoteX", mode="proxy")
+
+    def test_empty_parent_rejected_on_all_paths(self):
+        # --parent "" is falsy: next_generation guards it, but explicit --generation and
+        # known-id ingests skip that lookup — the bogus lineage field must not archive
+        m = meta("k1", parent="")
+        m["generation"] = 3
+        with self.assertRaises(ValueError):
+            score.ingest(self.root, self.cfg, result_text='{"fitness": 0.5}', meta=m,
+                         mode="full", split="inner")
+
+    def test_final_split_ingest_allowed_for_retracted_id(self):
+        # the holdout never feeds selection and never evicts a verdict — refusing it would
+        # block report-only validation while promising a reinstatement that can't happen
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 0.9}', meta=meta("r1"),
+                     mode="full", split="inner", env="box")
+        score.ingest(self.root, self.cfg,
+                     result_text='{"retract": true, "fitness": null, "guardrail": "revoked"}',
+                     meta=meta("r1"), mode="full", split="inner", env="box")
+        rec = score.ingest(self.root, self.cfg, result_text='{"fitness": 0.7}', meta=meta("r1"),
+                           mode="full", split="final", env="box")
+        self.assertEqual(rec["fitness"], 0.7)                      # report-only: fine
+        self.assertIn("r1", archive.retracted_ids(archive.load(self.root), cross_partition=True))
+
+    def test_ingest_unknown_parent_errors_unless_generation_given(self):
+        # The silent max+1 fallback once stamped a 74-record bulk ingest as generations 66-81
+        # ("stale for 74 generations", sampling refused) — an unknown parent is now an error,
+        # with --generation as the deliberate escape for cross-archive lineage.
+        with self.assertRaises(ValueError):
+            score.ingest(self.root, self.cfg, result_text='{"fitness": 0.5}',
+                         meta=meta("kid", parent="ghost"), mode="full", split="inner")
+        m = meta("kid", parent="ghost")
+        m["generation"] = 5
+        rec = score.ingest(self.root, self.cfg, result_text='{"fitness": 0.5}',
+                           meta=m, mode="full", split="inner")
+        self.assertEqual(rec["generation"], 5)
+        self.assertEqual(rec["parent"], "ghost")
 
     def test_ingest_survives_log_braces_and_multiple_objects(self):
         # A remote scoring log with braces and a leading progress object must not defeat the
@@ -272,6 +324,102 @@ class TestIngest(unittest.TestCase):
         rec = score.ingest(self.root, self.cfg, result_text=text, meta=meta("remote2"),
                            mode="proxy", split="inner", env="box")
         self.assertEqual(rec["fitness"], 1.5)
+
+    def test_ingest_retraction(self):
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 0.9}', meta=meta("r1", parent=None),
+                     mode="full", split="inner", env="box")
+        m = meta("r1")
+        m["generation"] = 7
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 0.95}', meta=m,
+                     mode="full", split="inner", env="box")
+        rec = score.ingest(self.root, self.cfg,
+                           result_text='{"retract": true, "fitness": null, "guardrail": "causality violation"}',
+                           meta=meta("r1"), mode="full", split="inner", env="box")
+        self.assertTrue(rec["retract"])
+        # bookkeeping, not search work: stamps the id's LATEST in-scope generation, not max+1
+        self.assertEqual(rec["generation"], 7)
+        self.assertIsNone(archive.best(self.root, "box"))          # out of selection
+
+    def test_ingest_retraction_env_scope_resolution(self):
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 0.9}', meta=meta("c1"),
+                     mode="full", split="inner", env="box")
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 1.1}', meta=meta("c1"),
+                     mode="full", split="inner", env="gpu")
+        retract = '{"retract": true, "fitness": null, "guardrail": "bad"}'
+        with self.assertRaises(ValueError):                        # two envs: must say which scope
+            score.ingest(self.root, self.cfg, result_text=retract, meta=meta("c1"),
+                         mode="full", split="inner")
+        with self.assertRaises(ValueError):                        # out-of-scope env cleans nothing
+            score.ingest(self.root, self.cfg, result_text=retract, meta=meta("c1"),
+                         mode="full", split="inner", env="nope")
+        score.ingest(self.root, self.cfg, result_text=retract, meta=meta("c1"),
+                     mode="full", split="inner", env="box")
+        recs = archive.load(self.root)
+        self.assertEqual(archive.valid(recs, selection_env="box"), [])
+        self.assertEqual([r["fitness"] for r in archive.valid(recs, selection_env="gpu")], [1.1])
+
+    def test_ingest_retraction_inherits_single_env(self):
+        # forgetting --env must not land the retraction in "external" where it cleans nothing
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 0.9}', meta=meta("c1"),
+                     mode="full", split="inner", env="box")
+        rec = score.ingest(self.root, self.cfg,
+                           result_text='{"retract": true, "fitness": null, "guardrail": "bad"}',
+                           meta=meta("c1"), mode="full", split="inner")
+        self.assertEqual(rec["env"], "box")
+        self.assertIsNone(archive.best(self.root, "box"))
+
+    def test_ingest_known_id_reuses_generation_and_hints_on_failure(self):
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 0.5}', meta=meta("k1"),
+                     mode="full", split="inner", env="box")        # gen 0 in an empty archive
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rec = score.ingest(self.root, self.cfg, result_text='{"fitness": null}',
+                               meta=meta("k1"), mode="full", split="inner", env="box")
+        self.assertEqual(rec["generation"], 0)                     # re-observation: no max+1 tick
+        self.assertIn("does NOT retract", buf.getvalue())          # and the operator is told why
+        self.assertEqual([r["fitness"] for r in archive.valid(archive.load(self.root))], [0.5])
+
+    def test_ingest_rejects_falsy_correct_with_fitness(self):
+        # the eval contract's correct is a hard failure on live evals for ANY falsy value
+        # (runner._score_of: false, 0, null); ingest must match, not just literal false —
+        # a remote adapter serializing correctness as 0/1 must not record a passing score
+        for payload in ('{"fitness": 0.5, "correct": false}',
+                        '{"fitness": 0.5, "correct": 0}',
+                        '{"fitness": 0.5, "correct": null}'):
+            with self.assertRaises(ValueError):
+                score.ingest(self.root, self.cfg, result_text=payload,
+                             meta=meta("r1"), mode="full", split="inner")
+        rec = score.ingest(self.root, self.cfg, result_text='{"fitness": null, "correct": false}',
+                           meta=meta("r1"), mode="full", split="inner")
+        self.assertIsNone(rec["fitness"])                          # inert failure, not retraction
+        self.assertNotIn("retract", rec)
+
+    def test_ingest_refuses_numeric_for_retracted_id_unless_reinstate(self):
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 0.9}', meta=meta("r1"),
+                     mode="full", split="inner", env="box")
+        score.ingest(self.root, self.cfg,
+                     result_text='{"retract": true, "fitness": null, "guardrail": "revoked"}',
+                     meta=meta("r1"), mode="full", split="inner", env="box")
+        with self.assertRaises(ValueError):                        # a wave must not launder it
+            score.ingest(self.root, self.cfg, result_text='{"fitness": 1.1}', meta=meta("r1"),
+                         mode="full", split="inner", env="other-box")
+        rec = score.ingest(self.root, self.cfg, result_text='{"fitness": null}', meta=meta("r1"),
+                           mode="full", split="inner", env="box")   # inert failure: fine
+        self.assertIsNone(rec["fitness"])
+        rec = score.ingest(self.root, self.cfg, result_text='{"fitness": 1.1}', meta=meta("r1"),
+                           mode="full", split="inner", env="box", reinstate=True)
+        self.assertEqual(rec["fitness"], 1.1)                      # deliberate reinstatement
+        self.assertEqual(archive.retracted_ids(archive.load(self.root), cross_partition=True), {})
+
+    def test_ingest_retraction_guards(self):
+        with self.assertRaises(ValueError):                        # unknown id retracts nothing
+            score.ingest(self.root, self.cfg, result_text='{"retract": true, "fitness": null}',
+                         meta=meta("nope"), mode="full", split="inner")
+        score.ingest(self.root, self.cfg, result_text='{"fitness": 0.9}', meta=meta("r1"),
+                     mode="full", split="inner")
+        with self.assertRaises(ValueError):                        # retraction can't carry a score
+            score.ingest(self.root, self.cfg, result_text='{"retract": true, "fitness": 0.5}',
+                         meta=meta("r1"), mode="full", split="inner")
 
 
 if __name__ == "__main__":

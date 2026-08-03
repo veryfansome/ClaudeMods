@@ -4,8 +4,8 @@ must not be folklore — the noise floor.
 Doctor never self-heals (the fix for drift is fixing the contract); it emits JSON and
 exits 2 on any failure. --measure-noise is the exception to read-only: it runs the
 proxy eval k times on the unmodified baseline and writes the measured floor into the
-config (with backup), because a promotion gate calibrated by assertion instead of
-measurement is how noise gets promoted as fitness.
+config (with backup), because a gate calibrated by assertion instead of
+measurement is how noise gets mistaken for fitness.
 """
 
 import datetime
@@ -29,7 +29,7 @@ def _check(checks, name, ok, detail=""):
     return ok
 
 
-def run(root, run_eval=False, measure_noise=False, dry=False):
+def run(root, run_eval=False, measure_noise=False, dry=False, force=False):
     checks, warnings = [], []
     root = pathlib.Path(root)
 
@@ -67,7 +67,8 @@ def run(root, run_eval=False, measure_noise=False, dry=False):
     if cfg["surface"]["mode"] == "markers":
         for path in cfg["surface"]["files"]:
             p = root / path
-            if not _check(checks, f"markers:{path}", p.exists(), "declared file missing"):
+            if not _check(checks, f"markers:{path}", p.exists(),
+                          "" if p.exists() else "declared file missing"):
                 continue
             try:
                 blocks = surface.parse_blocks(p.read_text(), path)
@@ -125,9 +126,12 @@ def run(root, run_eval=False, measure_noise=False, dry=False):
     floor = cfg["fitness"].get("noise_floor")
     if floor is None and not measure_noise:
         warnings.append("fitness.noise_floor is unmeasured — run `evolve doctor --measure-noise` "
-                        "before trusting any promotion decision")
+                        "before trusting any comparison built on it")
     meta = cfg["fitness"].get("noise_meta")
-    if floor is not None and meta and not measure_noise:
+    # Staleness applies only to a floor THIS tool measured (engine-written meta carries
+    # proxy_cmd_sha). A hand-derived floor with hand-written provenance is the project's own
+    # quantity — nagging "re-run --measure-noise" there recommends destroying it.
+    if floor is not None and meta and meta.get("proxy_cmd_sha") and not measure_noise:
         now = _noise_signature(cfg)
         if meta.get("proxy_cmd_sha") != now["proxy_cmd_sha"] or meta.get("env") != now["env"]:
             warnings.append("noise_floor is stale — the proxy eval command or environment changed "
@@ -143,6 +147,103 @@ def run(root, run_eval=False, measure_noise=False, dry=False):
         warnings.append(f"fitness.selection_env={sel_env!r} matches 0 scored records (envs present: "
                         f"{envs}) — selection is empty; re-baseline a candidate in this env or fix the tag")
 
+    retired = surface.retired_impls(root)
+    if retired:
+        live = [r["id"] for r in archive.best_per_id(archive.valid(all_recs, sel_env))
+                if surface.genome_selects_retired(r.get("genome") or {}, retired)]
+        if live:
+            warnings.append(f"{len(live)} live selectable candidate(s) select retired impls "
+                            f"({live[:5]}) — a retired mechanism stays reachable as a PARENT "
+                            "until its carriers are retracted (`evolve retract`) or the impl "
+                            "is un-retired")
+
+    # Pre-record-scoped-retraction archives: an id whose latest non-final record is a plain
+    # failure AFTER a scored one used to mean "retracted" (latest-verdict-wins). That gesture is
+    # inert now, so the old score silently re-entered selection — surface the ambiguity rather
+    # than let a revoked top-scorer keep driving sampling unnoticed.
+    latest, ever_scored = {}, set()
+    for r in all_recs:
+        rid = r.get("id")
+        if rid is None or r.get("split", cfgmod.DEFAULT_SPLIT) == cfgmod.FINAL_SPLIT:
+            continue
+        if isinstance(r.get("fitness"), (int, float)):
+            ever_scored.add(rid)
+        latest[rid] = r
+    legacy = sorted(rid for rid, r in latest.items()
+                    if rid in ever_scored and r.get("fitness") is None
+                    and not r.get("retract") and r.get("guardrail") not in (None, "pass"))
+    if legacy:
+        warnings.append(f"ids whose latest record is a failure after earlier scores: {legacy} — "
+                        "their scores still count (a plain failure does not retract). If any was a "
+                        'pre-upgrade revocation, re-ingest {"retract": true, "fitness": null, '
+                        '"guardrail": "<reason>"}; if it was a routine flake, rescore or ignore')
+
+    # Realized parent-selection pressure. λ is in units of 1/fitness, so a mis-scaled explicit
+    # value silently degrades sampling to uniform while everything else looks healthy — a
+    # field campaign ran 8 rounds of statistically-uniform parent picks before measuring it.
+    # This prints the numbers sampling actually uses (same helper), fitness pressure only, so
+    # the offspring penalty can't mask an inert λ.
+    per_id = archive.best_per_id(archive.valid(all_recs, sel_env))
+    if len(per_id) >= 2:
+        lam_cfg = cfg["search"].get("lambda", "auto")
+        lam, fit_w = archive.selection_weights(per_id, lam_cfg, {}, noise_floor=floor)
+        fits_sp = sorted(r["fitness"] for r in per_id)
+        med = fits_sp[len(fits_sp) // 2]
+        scale = archive.fitness_scale(fits_sp)
+        ratio = (max(fit_w) / min(fit_w)) if min(fit_w) > 0 else float("inf")
+        total = sum(fit_w)
+        below = sum(w for r, w in zip(per_id, fit_w) if r["fitness"] < med) / total if total else 0.0
+        auto = lam_cfg in (None, "auto")
+        _check(checks, "selection_pressure", True,
+               f"λ={lam:.4g} ({'auto' if auto else 'explicit'}) over {len(per_id)} candidates, "
+               f"fitness scale={scale:.4g}: P(best)/P(worst)={ratio:.3g}, "
+               f"P(below median)={below:.2f} (fitness pressure, before the novelty penalty)")
+        # Two failure directions, both keyed on the measured noise floor. Near-uniform is only
+        # a problem when there is REAL signal to discriminate (spread above the floor) — over
+        # statistically-identical candidates, near-uniform is correct, and nagging there
+        # pushes the operator to churn a protected config field in response to noise.
+        # Deliberate λ=0 (pure novelty-penalty sampling) is exempt.
+        near_uniform = ratio < 5 and scale > (floor or 0.0) and lam_cfg != 0
+        if near_uniform:
+            warnings.append(f"parent sampling is near-uniform (P(best)/P(worst)={ratio:.2g}) "
+                            "despite fitness spread above the noise floor — "
+                            + (f"the distribution may be outlier-dominated (scale {scale:.3g})"
+                               if auto else
+                               f"search.lambda={lam_cfg} is likely mis-scaled (λ is in units of "
+                               '1/fitness); set it to "auto" or rescale it'))
+        # A pin that drifted far from what auto would derive. Deliberate λ=0 is exempt here
+        # too, and when near-uniform already fired this advice would be a duplicate.
+        if not auto and lam_cfg != 0 and not near_uniform:
+            auto_lam = archive.resolve_lambda("auto", fits_sp, floor)
+            if auto_lam > 0 and (lam > 20 * auto_lam or lam < auto_lam / 20):
+                warnings.append(f"explicit search.lambda={lam_cfg} diverges from the auto-derived "
+                                f"value ({auto_lam:.4g}) by more than 20x — a pin silently opts "
+                                "out of scale tracking as the archive moves; re-derive it or set "
+                                '"auto"')
+        # The opposite direction: strong pressure applied to an ordering that is pure eval
+        # noise. Auto can't do this (its scale is floored at the noise floor), so only an
+        # explicit λ earns the warning.
+        if not auto and floor and scale <= floor and ratio >= 5:
+            warnings.append(f"population fitness spread ({scale:.3g}) is within the measured "
+                            f"noise floor ({floor}) but parent sampling pressure is "
+                            f"P(best)/P(worst)={ratio:.2g} — the ordering being amplified is "
+                            'noise; set search.lambda to "auto" (its pressure floors at the '
+                            "noise floor)")
+
+    if measure_noise:
+        # Refuse BEFORE paying for eval runs. An engine-written floor (noise_meta carries
+        # proxy_cmd_sha — this tool's own provenance) may be refreshed freely, keeping the
+        # staleness warning's advice a one-command fix; a hand-derived floor (no sha) may be a
+        # cross-seed quantity that this fixed-seed determinism measurement is NOT — clobbering
+        # it would also disable auto-λ's noise-floor guard, so that takes --force.
+        engine_written = bool((cfg["fitness"].get("noise_meta") or {}).get("proxy_cmd_sha"))
+        if cfg["fitness"].get("noise_floor") is not None and not engine_written and not force:
+            _check(checks, "noise_floor", True,
+                   f"NOT measured: fitness.noise_floor={cfg['fitness']['noise_floor']} is "
+                   "configured with hand-written provenance — possibly a cross-seed quantity "
+                   "this fixed-seed determinism measurement is not; pass --force to overwrite "
+                   "(no eval was spent)")
+            measure_noise = False
     if run_eval or measure_noise:
         runs = cfg["fitness"].get("noise_runs", 5) if measure_noise else 1
         try:
@@ -189,7 +290,7 @@ def _result(checks, warnings):
 def measure_env_offset(root, ref_id=None, dry=False):
     """Measure this environment's fitness offset vs. the environment a reference candidate was
     scored in — the 'measure-then-decide' upgrade to the plugin's assume-incomparable-and-warn
-    stance. Re-runs the reference (default: the champion) here, diffs against its recorded
+    stance. Re-runs the reference (default: the top-scoring record) here, diffs against its recorded
     fitness, and writes fitness.env_offsets[<this env>] with the same provenance shape as the
     noise floor. Informs whether environments may be folded (offset within noise) or must stay
     partitioned via selection_env; never gates on its own."""
@@ -197,14 +298,14 @@ def measure_env_offset(root, ref_id=None, dry=False):
     sel_env = cfg["fitness"].get("selection_env")
     if ref_id:
         scored = [r for r in archive.load(root)
-                  if r["id"] == ref_id and isinstance(r.get("fitness"), (int, float))]
+                  if r.get("id") == ref_id and isinstance(r.get("fitness"), (int, float))]
         # the id's authoritative recorded score (full outranks proxy, then higher fitness)
         ref = max(scored, key=lambda r: (r.get("mode") == "full", r["fitness"])) if scored else None
     else:
         ref = archive.best(root, sel_env)
     if ref is None:
         return {"ok": False, "error": f"no reference candidate to measure against "
-                f"({'id ' + repr(ref_id) if ref_id else 'no champion — score something first'})"}
+                f"({'id ' + repr(ref_id) if ref_id else 'no scored record — score something first'})"}
     if ref.get("fitness") is None:
         return {"ok": False, "error": f"reference {ref['id']!r} has no numeric fitness to compare against"}
 
