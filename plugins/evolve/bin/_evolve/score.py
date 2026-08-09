@@ -14,9 +14,10 @@ import json
 import platform
 import shutil
 import subprocess
+import sys
 
 from . import archive, novelty, runner, surface
-from .config import DEFAULT_SPLIT
+from .config import DEFAULT_SPLIT, FINAL_SPLIT
 
 
 class Rejection(Exception):
@@ -49,8 +50,9 @@ def _impls_artifact_dir(root):
 def _scored_safe_ids(root):
     """safe_ids of candidates that have at least one numerically-scored record — the only
     ones dedup compares against (a near-dup of a FAILED candidate is worth letting through:
-    it might be the fix). Also keeps init's sabotage probe from poisoning the corpus."""
-    return {archive._safe_id(r["id"]) for r in archive.valid(archive.load(root))}
+    it might be the fix). Also keeps init's sabotage probe from poisoning the corpus.
+    Uses scored_any, not valid(): a RETRACTED id stays in dedup memory."""
+    return {archive._safe_id(r["id"]) for r in archive.scored_any(archive.load(root))}
 
 
 def _archived_regions(root):
@@ -60,7 +62,7 @@ def _archived_regions(root):
     if not d.is_dir():
         return []
     scored = _scored_safe_ids(root)
-    by_safe = {archive._safe_id(r["id"]): r["id"] for r in archive.valid(archive.load(root))}
+    by_safe = {archive._safe_id(r["id"]): r["id"] for r in archive.scored_any(archive.load(root))}
     return [(by_safe.get(p.stem, p.stem), p.read_text()) for p in sorted(d.iterdir())
             if p.suffix == ".txt" and p.stem in scored]
 
@@ -101,7 +103,12 @@ def score_candidate(root, cfg, *, mode="proxy", split=DEFAULT_SPLIT, meta,
     rec = {k: meta.get(k) for k in archive.META_KEYS}
     if not rec.get("id"):
         raise ValueError("meta.id is required")
-    rec["generation"] = meta.get("generation", archive.next_generation(root, rec.get("parent")))
+    if rec.get("parent") == "":
+        raise ValueError('--parent "" is empty — pass a real archived id or omit the flag')
+    # Lazy on purpose: an explicit generation (rescore replays, --generation) must not run
+    # next_generation's parent lookup at all — its unknown-parent error is for NEW records.
+    gen = meta.get("generation")
+    rec["generation"] = archive.next_generation(root, rec.get("parent")) if gen is None else gen
     rec.update({"mode": mode, "split": split, "env": env or default_env(),
                 "commit": _head_commit(root)})
 
@@ -180,7 +187,7 @@ def score_candidate(root, cfg, *, mode="proxy", split=DEFAULT_SPLIT, meta,
 
 def _persist_artifacts(root, cfg, rec, patch, mutable, genome, scored):
     """Reproduction + brief corpus. Diffs/impl copies are kept for ALL candidates (debug +
-    adopt survives `git clean`); the region/impl-hash corpus that feeds dedup + inspirations
+    `apply` survives `git clean`); the region/impl-hash corpus that feeds dedup + inspirations
     is kept only for SCORED candidates."""
     sid = archive._safe_id(rec["id"])
     if rec["surface"]["mode"] == "markers" and patch and patch.strip():
@@ -193,7 +200,7 @@ def _persist_artifacts(root, cfg, rec, patch, mutable, genome, scored):
             rec["surface"]["mutable_sha"] = surface_sha(mutable)
     elif rec["surface"]["mode"] == "registry" and genome is not None:
         rec["surface"]["impl_shas"] = surface.impl_shas(genome, root, cfg)
-        # Copy referenced impl code so brief/adopt/re-score survive a working-tree change
+        # Copy referenced impl code so brief/apply/re-score survive a working-tree change
         # (branch switch, `git clean`) that removes an untracked impl an archived genome names.
         dest = _impls_artifact_dir(root) / sid
         dest.mkdir(parents=True, exist_ok=True)
@@ -209,12 +216,12 @@ def surface_sha(mutable):
 
 
 def _check_id_payload(root, rec_id, mutable_sha=None, impl_shas=None):
-    """An id may be re-scored (rerun, promotion), but never reused for a DIFFERENT candidate
+    """An id may be re-scored (rerun, full re-score), but never reused for a DIFFERENT candidate
     — an id that silently changes meaning corrupts every comparison built on it. Both surfaces
     compare content hashes: markers via mutable_sha, registry via per-axis impl content hashes
     (so editing an untracked impl in place and re-scoring the same id is refused)."""
     for r in archive.load(root):
-        if r["id"] != rec_id:
+        if r.get("id") != rec_id:
             continue
         surf = r.get("surface") or {}
         prior_m = surf.get("mutable_sha")
@@ -253,11 +260,11 @@ def score_seed(root, cfg, *, mode="proxy", split=DEFAULT_SPLIT, env=None, seed_i
 
 def rescore(root, cfg, *, rec_id, mode, split=DEFAULT_SPLIT, env=None, no_archive=False):
     """Re-run an already-archived candidate under a (possibly) new mode/split, reusing its id
-    — the primitive for proxy->full promotion, paired champion reruns, and final-split
-    validation. Replays from the stored artifact (patch or genome), so it needs no worktree
+    — the primitive for proxy->full re-scores, paired reruns of a reference candidate, and
+    final-split validation. Replays from the stored artifact (patch or genome), so it needs no worktree
     and self-excludes from dedup. The id-payload check guarantees the same code runs.
     no_archive replays it WITHOUT recording (e.g. an env-offset measurement)."""
-    matches = [r for r in archive.load(root) if r["id"] == rec_id]
+    matches = [r for r in archive.load(root) if r.get("id") == rec_id]
     if not matches:
         raise ValueError(f"no archived candidate with id {rec_id!r} to re-score")
     # Prefer the most-recent record that actually carries reproducible CODE — an id can also
@@ -267,7 +274,16 @@ def rescore(root, cfg, *, rec_id, mode, split=DEFAULT_SPLIT, env=None, no_archiv
         repro = [r for r in matches if (r.get("surface") or {}).get("patch")]
     else:
         repro = [r for r in matches if isinstance(r.get("genome"), dict)]
-    src = repro[-1] if repro else matches[-1]
+    if repro:
+        src = repro[-1]
+    else:
+        # No reproducible artifact — maybe the markers seed (empty patch, never persisted).
+        # Scan for a seed-shaped record instead of keying on matches[-1]: an ingested record
+        # or a retraction appended later must not mask the seed and break the documented
+        # reinstate-by-rescore path.
+        seedish = [r for r in matches
+                   if (r.get("surface") or {}).get("mode") == "markers" and r.get("parent") is None]
+        src = seedish[-1] if seedish else matches[-1]
     surf = src.get("surface") or {}
     meta = {"id": rec_id, "parent": src.get("parent"), "generation": src.get("generation"),
             "inventor": src.get("inventor"), "operator": src.get("operator"),
@@ -318,9 +334,17 @@ def _restore_impls(root, cfg, genome, artifact_rel):
         shutil.copy2(hits[0], dest_dir / name)
 
 
-def ingest(root, cfg, *, result_text, meta, mode, split, env=None, genome=None):
+def ingest(root, cfg, *, result_text, meta, mode, split, env=None, genome=None, reinstate=False):
     """Append an externally-scored result (e.g. a remote scoring box) without re-running.
-    Scores are only comparable within one environment — the env tag is the audit trail."""
+    Scores are only comparable within one environment — the env tag is the audit trail.
+
+    RETRACTION: a result of `{"retract": true, "fitness": null, "guardrail": "<reason>"}`
+    invalidates the id's earlier records in the same selection scope (see archive.valid).
+    The marker must be explicit — an ordinary failure result stays inert search signal.
+    A retracted id REFUSES further numeric ingests unless reinstate=True: a validity verdict
+    is a property of the mechanism, not the dataset, so a routine re-measurement (e.g. a
+    regime-change wave) must not launder a revoked candidate clean by appending a fresh
+    score after its retraction. Reinstatement is a decision, not a side effect."""
     res = runner.last_json_object(result_text)
     if res is None:
         raise ValueError("no JSON object found in the result file")
@@ -328,16 +352,92 @@ def ingest(root, cfg, *, result_text, meta, mode, split, env=None, genome=None):
     if fitness is not None and (not isinstance(fitness, (int, float)) or isinstance(fitness, bool)):
         raise ValueError("ingested result carries a non-numeric fitness/combined_score "
                          "(a bool is not a valid score)")
+    if not res.get("correct", True) and fitness is not None:
+        # Mirror runner._score_of exactly, which fails on ANY falsy correct (false, 0, null, "")
+        # — a remote adapter that serializes correctness as 0/1 must not ingest as a PASSING
+        # score; that exact mismatch once turned an attempted revocation into a passing duplicate.
+        raise ValueError("ingested result has a falsy 'correct' alongside a numeric fitness — "
+                         "refusing to record a passing score for a failed run; drop the fitness "
+                         "(records an inert failure) or ingest a retraction "
+                         '({"retract": true, "fitness": null, "guardrail": "<reason>"})')
     if genome is not None and not isinstance((genome or {}).get("chunks"), dict):
         raise ValueError("ingested --genome must be a registry genome with a 'chunks' object")
     rec = {k: meta.get(k) for k in archive.META_KEYS}
     if not rec.get("id"):
         raise ValueError("meta.id is required")
-    rec["generation"] = meta.get("generation", archive.next_generation(root, rec.get("parent")))
-    rec.update({"mode": mode, "split": split, "env": env or res.get("env") or "external",
+    if rec.get("parent") == "":
+        raise ValueError('--parent "" is empty — pass a real archived id or omit the flag')
+    retract = bool(res.get("retract"))
+    all_recs = archive.load(root)
+    prior = [r for r in all_recs if r.get("id") == rec["id"]]
+    env_given = env or res.get("env")
+    rec_env = env_given or "external"
+    if fitness is not None and not reinstate and split != FINAL_SPLIT:
+        # final-split ingests can't launder anything: the holdout never feeds selection and
+        # never evicts a verdict, so only selection-side ingests need the reinstate ceremony
+        verdict = archive.retracted_ids(all_recs, cross_partition=True).get(rec["id"])
+        if verdict is not None:
+            raise ValueError(f"id {rec['id']!r} is retracted ({verdict}) — its scores are invalid "
+                             "by verdict, in every partition. Reinstating is a decision, not a "
+                             "side effect of a re-measurement: pass --reinstate to deliberately "
+                             "append this score (append order then reinstates the id; on a "
+                             "selection_env-pinned project also pass --env with the id's own "
+                             "partition so the reinstating record lands where selection looks), "
+                             "or use `evolve rescore` to replay it under the engine's own eval")
+    if retract:
+        if fitness is not None:
+            raise ValueError("retract: true must come with fitness null — a retraction invalidates "
+                             "earlier records; a corrected score is a separate, later ingest")
+        if not prior:
+            raise ValueError(f"no archived record with id {rec['id']!r} — a typo'd id would "
+                             "retract nothing, silently")
+        if split == FINAL_SPLIT:
+            raise ValueError("a retraction on the final split registers in NO view — holdout "
+                             "records neither evict nor carry verdicts; retract on the id's "
+                             "selection split instead")
+        # A retraction only bites inside its (split-class, env) scope — archive.valid partitions
+        # BEFORE deciding what a retraction invalidates. Resolve the scope against the records it
+        # is meant to clean, or a forgotten/typo'd --env yields a retraction that is accepted,
+        # prints success, and invalidates nothing (the leaderboard keeps the tainted score).
+        scope = [r for r in prior if r.get("split", DEFAULT_SPLIT) != FINAL_SPLIT]
+        if not scope:
+            raise ValueError(f"id {rec['id']!r} has only final-split records — there is nothing on "
+                             "the selection side to retract")
+        env_pool = {r.get("env") for r in scope}
+        names = sorted((e or "<none>") for e in env_pool)
+        if env_given is not None and env_given not in env_pool:
+            raise ValueError(f"retraction env {env_given!r} matches none of {rec['id']!r}'s records "
+                             f"(envs: {names}) — an out-of-scope retraction would invalidate "
+                             "nothing, silently")
+        if env_given is None and len(env_pool) > 1:
+            raise ValueError(f"id {rec['id']!r} has records in several envs ({names}) — pass --env "
+                             "to say which scope this retraction cleans")
+        rec_env = env_given if env_given is not None else next(iter(env_pool))  # inherit, like generation
+        scoped_prior = [r for r in scope if r.get("env") == rec_env]
+    gen = meta.get("generation")
+    if gen is None:
+        if retract:
+            # Bookkeeping, not search work: stamp the retracted id's own generation so it never
+            # advances max(generation) (which feeds the budget/staleness math).
+            gen = int(scoped_prior[-1].get("generation") or 0)
+        elif prior:
+            # Re-observation of a known candidate (a cross-env re-ingest, a remote failure
+            # record): generation is a property of the candidate, not of the record — reuse it
+            # rather than ticking max+1 into the budget/staleness math.
+            gen = int(prior[-1].get("generation") or 0)
+        else:
+            gen = archive.next_generation(root, rec.get("parent"))
+    rec["generation"] = gen
+    rec.update({"mode": mode, "split": split, "env": rec_env,
                 "commit": res.get("commit"),
                 "fitness": fitness,
                 "guardrail": res.get("guardrail", "pass" if fitness is not None else "ingested failure")})
+    if retract:
+        rec["retract"] = True
+    elif fitness is None and any(isinstance(r.get("fitness"), (int, float)) for r in prior):
+        print(f"evolve: note — this failure record does NOT retract {rec['id']!r}'s earlier scores; "
+              'to invalidate them, ingest {"retract": true, "fitness": null, "guardrail": "<reason>"}',
+              file=sys.stderr)
     for k in ("seeds", "per_seed", "public", "text_feedback"):
         if res.get(k) is not None:
             rec[k] = res[k]

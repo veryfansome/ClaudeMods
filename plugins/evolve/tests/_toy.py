@@ -85,7 +85,7 @@ def markers_config():
             "splits": ["inner", "final"],
         },
         "fitness": {"noise_floor": 0.0, "noise_runs": 3, "noise_meta": None, "selection_env": None},
-        "search": {"lambda": 10.0, "inspirations": {"archive": 2, "top_k": 2},
+        "search": {"lambda": "auto", "inspirations": {"archive": 2, "top_k": 2},
                    "op_probs": {"diff": 0.5, "rewrite": 0.4, "cross": 0.1},
                    "dedup_similarity": 0.95, "insights_interval": 8, "standing_rules": []},
         "budget": {"max_generations": 40, "max_full_evals": 15, "stop_after_stale_rounds": 6},

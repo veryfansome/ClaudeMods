@@ -7,20 +7,35 @@ inventors; this CLI decides. Verbs:
   init            scaffold evolve/ into the project (idempotent)
   doctor          contract health pass; --measure-noise writes the measured floor
   seed            score + archive the unmodified baseline as gen 0
-  sample          parent + operator + inspirations per inventor slot (budget-enforced)
-  brief           the full inventor brief context for one slot (markdown)
+  sample          parent + operator + inspirations per inventor slot (budget-enforced);
+                  persists the slot table to evolve/rounds/ — the assignment is the round's
+                  evidence base, distinct from what candidates later CLAIM as --parent
+  brief           the full inventor brief context for one slot (markdown). --diet emits
+                  the information-diet form instead: parent genome + parent fitness +
+                  baseline + prior mechanisms as SOURCE with no outcome attached — and
+                  refuses to emit at all if its own leak assertions trip
+  jail            build one registry inventor's isolated workspace: the diet brief, the
+                  project-declared harness files, exactly the granted impl sources, and
+                  PROPOSAL/ — nothing else (the archive, the config and project docs are
+                  deliberately absent). The diet cleans the channel; the jail makes it
+                  the ONLY channel — they are sufficient only together
   guard           validate a candidate (worktree or genome) without scoring
   score           guard -> dedup -> pristine-clone eval -> record
-  preregister     commit a round's promotion gates BEFORE scoring candidates (immutable);
-                  G1 fitness-non-regression is auto-derived from the champion + noise floor
-  gate            check a candidate against a round's pre-registered gates (G1 is numeric)
   rescore         re-run an archived candidate under a new mode/split, reusing its id
-                  (proxy->full promotion, paired champion rerun, final-split validation)
+                  (proxy->full re-score, paired rerun, final-split validation)
   ingest          append an externally-scored result (tag --env; scores only compare
-                  within one environment)
+                  within one environment). A retracted id refuses numeric ingests unless
+                  --reinstate — reinstatement is a decision, not a wave side effect
+  retract         append an explicit retraction for an archived id: its earlier scores stop
+                  counting (in every partition — a validity verdict is a property of the
+                  mechanism, not the dataset); history stays; a deliberate rescore reinstates
   board           leaderboard + budget + neutral per-inventor/operator stats
   impls           list registered impls for a registry axis
-  adopt           apply an archived candidate to the working tree (markers mode)
+  apply           materialize an archived candidate: print its genome (registry) or apply
+                  its patch to the working tree (markers); --dry prints without applying.
+                  Retrieval only — the search has no promotion/adoption step; validity is
+                  per-candidate (eval.guardrails at score time, retraction post hoc), and
+                  what you do with an artifact downstream is outside the engine
 
 Exit codes: 0 ok · 1 error · 2 doctor/config failure · 3 budget exhausted ·
 4 guard violation · 5 novelty rejection · 6 infrastructure failure (export/setup — NOT
@@ -35,7 +50,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from _evolve import archive, board, brief, config as cfgmod, doctor, prereg, runner, scaffold, score, surface  # noqa: E402
+from _evolve import archive, board, brief, config as cfgmod, diet, doctor, jail, rounds, runner, scaffold, score, surface  # noqa: E402
 
 
 def find_root(explicit):
@@ -55,7 +70,7 @@ def _fail(msg, code=1):
 def _meta(args):
     return {"id": args.id, "parent": args.parent, "inventor": args.inventor,
             "operator": args.operator, "axis_changed": getattr(args, "axis_changed", None),
-            "rationale": args.rationale}
+            "rationale": args.rationale, "generation": getattr(args, "generation", None)}
 
 
 def _check_split(cfg, split):
@@ -74,22 +89,10 @@ def cmd_doctor(root, args):
         res = doctor.measure_env_offset(root, ref_id=args.ref, dry=args.dry)
         print(json.dumps(res, indent=1))
         raise SystemExit(0 if res.get("ok") else 2)
-    res = doctor.run(root, run_eval=args.run_eval, measure_noise=args.measure_noise, dry=args.dry)
+    res = doctor.run(root, run_eval=args.run_eval, measure_noise=args.measure_noise, dry=args.dry,
+                     force=args.force)
     print(json.dumps(res, indent=1))
     raise SystemExit(0 if res["ok"] else 2)
-
-
-def cmd_preregister(root, args):
-    cfg = cfgmod.load(root)
-    rec = prereg.register(root, cfg, round_tag=args.round, g2_desc=args.g2,
-                          g2_threshold=args.g2_threshold, g3_desc=args.g3, split=args.split)
-    print(json.dumps(rec, indent=2))
-
-
-def cmd_gate(root, args):
-    cfg = cfgmod.load(root)
-    rep = prereg.check_gate(root, cfg, round_tag=args.round, candidate_id=args.id)
-    print(json.dumps(rep, indent=2))
 
 
 def cmd_seed(root, args):
@@ -114,7 +117,8 @@ def cmd_sample(root, args):
     for i in range(args.k):
         slot_seed = f"{args.seed}:{i}"
         parent = archive.sample_parent(root, seed=slot_seed, lam=cfg["search"]["lambda"],
-                                       selection_env=sel_env)
+                                       selection_env=sel_env,
+                                       noise_floor=cfg["fitness"].get("noise_floor"))
         ops, weights = zip(*probs.items())
         op = random.Random(f"op:{slot_seed}").choices(ops, weights=weights, k=1)[0]
         cross_with = None
@@ -135,13 +139,44 @@ def cmd_sample(root, args):
         if axes:  # registry: pick which axis this slot mutates (round-robins across axes)
             slot["axis"] = axes[i % len(axes)]
         slots.append(slot)
-    print(json.dumps({"slots": slots, "budget": state}, indent=1))
+    if args.dry:
+        # diagnostics (pressure checks, verification draws) must not pollute evolve/rounds/
+        # with slot files for rounds nobody will dispatch
+        print(json.dumps({"slots": slots, "budget": state, "dry": True}, indent=1))
+        return
+    slots_file = rounds.save_slots(root, args.seed, slots)   # assignments must outlive stdout
+    print(json.dumps({"slots": slots, "budget": state,
+                      "slots_file": str(slots_file.relative_to(root))}, indent=1))
 
 
 def cmd_brief(root, args):
     cfg = cfgmod.load(root)
+    if args.diet:
+        text, _, warns = diet.build(root, cfg, operator=args.operator, parent_id=args.parent,
+                                    axis=args.axis, cross_with=args.cross_with, seed=args.seed,
+                                    baseline_id=args.baseline_id,
+                                    baseline_fitness=args.baseline_fitness)
+        for w in warns:
+            print(f"warn: {w}", file=sys.stderr)
+        print(text, end="")
+        return
     print(brief.build(root, cfg, operator=args.operator, parent_id=args.parent,
                       axis=args.axis, cross_with=args.cross_with, seed=args.seed))
+
+
+def cmd_jail(root, args):
+    cfg = cfgmod.load(root)
+    path, warnings = jail.build(root, cfg, parent_id=args.parent, axis=args.axis,
+                                round_tag=args.round, slot=args.slot, operator=args.operator,
+                                cross_with=args.cross_with, seed=args.seed,
+                                jail_root=args.jail_root, force=args.force,
+                                baseline_id=args.baseline_id,
+                                baseline_fitness=args.baseline_fitness)
+    for w in warnings:
+        print(f"warn: {w}", file=sys.stderr)
+    print(json.dumps({"jail": str(path),
+                      "note": "launch the inventor with this as its cwd; its whole "
+                              "grounding is BRIEF.md + JAIL_README.md"}, indent=1))
 
 
 def cmd_guard(root, args):
@@ -188,9 +223,33 @@ def cmd_ingest(root, args):
     genome = json.loads(pathlib.Path(args.genome).read_text()) if args.genome else None
     rec = score.ingest(root, cfg, result_text=pathlib.Path(args.result).read_text(),
                        meta=_meta(args), mode=args.mode, split=args.split, env=args.env,
-                       genome=genome)
+                       genome=genome, reinstate=args.reinstate)
     print(json.dumps({k: rec.get(k) for k in ("id", "fitness", "guardrail", "mode", "split", "env")},
                      indent=1))
+
+
+def cmd_retract(root, args):
+    """First-class retraction: the marker used to require hand-crafting {"retract": true}
+    into a result JSON, and both field mis-retractions (8 silent no-ops, one never-effective
+    revocation) came from getting that ceremony wrong. Success is judged by EFFECT — the
+    verdict must actually register — never by the append going through."""
+    cfg = cfgmod.load(root)
+    _check_split(cfg, args.split)   # a typo'd split would retract the WRONG partition, silently
+    payload = json.dumps({"retract": True, "fitness": None, "guardrail": args.reason})
+    rec = score.ingest(root, cfg, result_text=payload, meta={"id": args.id},
+                       mode=args.mode, split=args.split, env=args.env)
+    verdicts = archive.retracted_ids(archive.load(root), cross_partition=True)
+    if verdicts.get(args.id) is None:
+        _fail(f"retraction record appended but the verdict registers in NO validity view — "
+              f"inspect the archive for id {args.id!r} (this is the silent-no-op class this "
+              "verb exists to prevent; it should be unreachable)")
+    print(json.dumps({"retracted": args.id, "reason": verdicts[args.id],
+                      "scope": "all partitions — a validity verdict is a property of the "
+                               f"mechanism; the fitness view drops it in env {rec.get('env')!r}",
+                      "record": {k: rec.get(k) for k in ("id", "env", "split", "generation")},
+                      "note": "verify by effect: gone from `evolve board` when its env is the "
+                              "selection_env; archive.retracted_ids(cross_partition=True) is "
+                              "the global view"}, indent=1))
 
 
 def cmd_board(root, args):
@@ -204,29 +263,67 @@ def cmd_impls(root, args):
     if cfg["surface"]["mode"] != "registry":
         _fail("impls applies to registry-mode projects")
     axes = [args.axis] if args.axis else sorted(cfg["surface"]["registry"]["axes"])
-    print(json.dumps({a: surface.list_impls(root, cfg, a) for a in axes}, indent=1))
+    retired = surface.retired_impls(root)
+    out = {a: [i for i in surface.list_impls(root, cfg, a) if f"{a}/{i}" not in retired]
+           for a in axes}   # retired impls are not live options (evolve/retired_impls.json)
+    print(json.dumps(out, indent=1))
 
 
-def cmd_adopt(root, args):
+def cmd_apply(root, args):
+    """Materialize an archived candidate's artifact. Retrieval only: no gates, no records —
+    the search has no promotion/adoption step (an anchor the search is told to beat is a
+    champion at any timescale), so what happens to an artifact downstream is outside the
+    engine. Prefers the artifact of the id's AUTHORITATIVE selectable record: ingest has no
+    payload check, so a later ingested record can carry a DIFFERENT genome, and handing that
+    out under the id would materialize wrong code."""
     cfg = cfgmod.load(root)
-    recs = [r for r in archive.load(root) if r["id"] == args.id]
+    recs = [r for r in archive.load(root) if r.get("id") == args.id]
     if not recs:
         _fail(f"no archived record with id {args.id!r}")
-    rec = recs[-1]
+    sel_env = cfg["fitness"].get("selection_env")
+    auth = next((r for r in archive.best_per_id(archive.valid(archive.load(root), sel_env))
+                 if r["id"] == args.id), None)
+
+    def artifact(r):
+        return isinstance(r.get("genome"), dict) or (r.get("surface") or {}).get("patch")
+
+    def seed_shaped(r):
+        return ((r.get("surface") or {}).get("mode") == "markers" and r.get("parent") is None
+                and not (r.get("surface") or {}).get("patch"))
+    if auth is not None and artifact(auth):
+        rec = auth
+    else:
+        # No artifact anywhere — maybe the markers seed (its empty patch is never persisted).
+        # Identify it from ANY of the id's records: a later ingest or retraction record carries
+        # no surface at all, so testing only the newest record would misread the seed as an
+        # artifact-less ingest and fail with a misleading error.
+        rec = next((r for r in reversed(recs) if artifact(r)),
+                   next((r for r in recs if seed_shaped(r)), recs[-1]))
+    out = {"id": args.id}
+    if auth is None:
+        out["note"] = (f"{args.id!r} has no selectable record (retracted or filtered) — "
+                       "its archived scores are not trusted")
+    seedish = seed_shaped(rec)
     if isinstance(rec.get("genome"), dict):
-        print(json.dumps({"id": args.id, "genome": rec["genome"],
-                          "note": "registry adoption = use this genome as the shipped recipe"}, indent=1))
-        return
-    rel = (rec.get("surface") or {}).get("patch")
-    if not rel:
-        _fail(f"record {args.id!r} carries no patch (was it the seed?)")
-    patch = (cfgmod.state_dir(root) / rel).read_text()
-    r = subprocess.run(["git", "apply", "--whitespace=nowarn"], input=patch, text=True,
-                       capture_output=True, cwd=root)
-    if r.returncode != 0:
-        _fail(f"patch no longer applies to the working tree: {r.stderr.strip()}")
-    print(json.dumps({"adopted": args.id, "applied": rel,
-                      "note": "review + commit the change like any other diff"}, indent=1))
+        out["genome"] = rec["genome"]
+    elif seedish:
+        out["note"] = ((out["note"] + "; ") if "note" in out else "") + "the unmodified baseline — nothing to apply"
+    else:
+        rel = (rec.get("surface") or {}).get("patch")
+        if not rel:
+            _fail(f"record {args.id!r} carries no artifact (an ingested record holds only its "
+                  "score — apply where the candidate was produced)")
+        out["patch"] = f"{cfgmod.STATE_DIR}/{rel}"
+        if args.dry:
+            out["diff"] = (cfgmod.state_dir(root) / rel).read_text()
+        else:
+            patch = (cfgmod.state_dir(root) / rel).read_text()
+            r = subprocess.run(["git", "apply", "--whitespace=nowarn"], input=patch, text=True,
+                               capture_output=True, cwd=root)
+            if r.returncode != 0:
+                _fail(f"patch no longer applies to the working tree: {r.stderr.strip()}")
+            out["applied"] = rel
+    print(json.dumps(out, indent=1))
 
 
 def main(argv=None):
@@ -247,36 +344,73 @@ def main(argv=None):
         p.add_argument("--operator", default=None)
         p.add_argument("--axis-changed", dest="axis_changed", default=None)
         p.add_argument("--rationale", default=None)
+        p.add_argument("--generation", type=int, default=None,
+                       help="explicit generation stamp (default: parent's + 1; required when "
+                            "--parent names an id this archive doesn't hold)")
 
     p = sub.add_parser("init"); p.add_argument("--mode", default="markers", choices=["markers", "registry"]); p.set_defaults(fn=cmd_init)
     p = sub.add_parser("doctor"); p.add_argument("--run-eval", action="store_true")
     p.add_argument("--measure-noise", action="store_true"); p.add_argument("--dry", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="allow --measure-noise to overwrite an already-configured noise floor")
     p.add_argument("--measure-env-offset", action="store_true",
                    help="re-run a reference candidate here and record this env's fitness offset")
-    p.add_argument("--ref", default=None, help="reference candidate id for --measure-env-offset (default: champion)")
+    p.add_argument("--ref", default=None, help="reference candidate id for --measure-env-offset (default: top-scoring record)")
     p.set_defaults(fn=cmd_doctor)
     p = sub.add_parser("seed"); add_mode_split(p); p.add_argument("--id", default="gen0-baseline")
     p.add_argument("--no-archive", action="store_true"); p.set_defaults(fn=cmd_seed)
-    p = sub.add_parser("sample"); p.add_argument("--k", type=int, default=3); p.add_argument("--seed", default="0"); p.set_defaults(fn=cmd_sample)
+    p = sub.add_parser("sample"); p.add_argument("--k", type=int, default=3)
+    p.add_argument("--dry", action="store_true",
+                   help="diagnostic draw: print slots without persisting a slots file")
+    p.add_argument("--seed", required=True,
+                   help="round tag — assignments persist to evolve/rounds/<seed>-<hash>-slots.json (exact path printed as slots_file), and "
+                        "a round's assignments are immutable evidence, so every round needs a "
+                        "fresh seed")
+    p.set_defaults(fn=cmd_sample)
     p = sub.add_parser("brief"); p.add_argument("--operator", default="diff", choices=list(cfgmod.OPERATORS))
     p.add_argument("--parent", default=None); p.add_argument("--axis", default=None)
-    p.add_argument("--cross-with", dest="cross_with", default=None); p.add_argument("--seed", default="0"); p.set_defaults(fn=cmd_brief)
+    p.add_argument("--cross-with", dest="cross_with", default=None); p.add_argument("--seed", default="0")
+    p.add_argument("--diet", action="store_true",
+                   help="emit the information-diet brief: parent + baseline + score-free "
+                        "mechanism sources; refuses to emit on any leak")
+    p.add_argument("--baseline-id", default="gen0-baseline")
+    p.add_argument("--baseline-fitness", type=float, default=None,
+                   help="override reading the baseline's fitness from the archive")
+    p.set_defaults(fn=cmd_brief)
+    p = sub.add_parser("jail"); p.add_argument("--parent", required=True)
+    p.add_argument("--axis", required=True); p.add_argument("--round", required=True)
+    p.add_argument("--slot", type=int, required=True)
+    p.add_argument("--operator", default="diff", choices=list(cfgmod.OPERATORS))
+    p.add_argument("--cross-with", dest="cross_with", default=None)
+    p.add_argument("--seed", default="0")
+    p.add_argument("--jail-root", dest="jail_root", default=None,
+                   help="where jails live (default: ~/.cache/evolve-jails/<project> — "
+                        "outside the repo so a jail can never be committed)")
+    p.add_argument("--force", action="store_true", help="rebuild over an existing jail")
+    p.add_argument("--baseline-id", default="gen0-baseline")
+    p.add_argument("--baseline-fitness", type=float, default=None)
+    p.set_defaults(fn=cmd_jail)
     p = sub.add_parser("guard"); p.add_argument("--candidate", default=None); p.add_argument("--genome", default=None); p.set_defaults(fn=cmd_guard)
     p = sub.add_parser("score"); p.add_argument("--candidate", default=None); p.add_argument("--patch", default=None)
     p.add_argument("--genome", default=None); p.add_argument("--force", action="store_true")
     p.add_argument("--no-archive", action="store_true"); add_meta(p); add_mode_split(p); p.set_defaults(fn=cmd_score)
-    p = sub.add_parser("preregister"); p.add_argument("--round", required=True)
-    p.add_argument("--g2", required=True, help="the round objective: a one-line predicate")
-    p.add_argument("--g2-threshold", dest="g2_threshold", type=float, default=None)
-    p.add_argument("--g3", default=None, help="advisory metric (non-sufficient, non-necessary)")
-    p.add_argument("--split", default=None); p.set_defaults(fn=cmd_preregister)
-    p = sub.add_parser("gate"); p.add_argument("--round", required=True); p.add_argument("--id", required=True)
-    p.set_defaults(fn=cmd_gate)
     p = sub.add_parser("rescore"); p.add_argument("--id", required=True); add_mode_split(p); p.set_defaults(fn=cmd_rescore)
-    p = sub.add_parser("ingest"); p.add_argument("--result", required=True); p.add_argument("--genome", default=None); add_meta(p); add_mode_split(p); p.set_defaults(fn=cmd_ingest)
+    p = sub.add_parser("ingest"); p.add_argument("--result", required=True); p.add_argument("--genome", default=None)
+    p.add_argument("--reinstate", action="store_true",
+                   help="deliberately append a numeric score for a RETRACTED id (append order "
+                        "then reinstates it)")
+    add_meta(p); add_mode_split(p); p.set_defaults(fn=cmd_ingest)
+    p = sub.add_parser("retract"); p.add_argument("--id", required=True)
+    p.add_argument("--reason", required=True, help="the audit trail: why the id's scores stop counting")
+    p.add_argument("--env", default=None, help="scope tag when the id has records in several envs")
+    p.add_argument("--split", default=cfgmod.DEFAULT_SPLIT)
+    p.add_argument("--mode", default="proxy", choices=["proxy", "full"])
+    p.set_defaults(fn=cmd_retract)
     p = sub.add_parser("board"); p.add_argument("--top", type=int, default=10); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_board)
     p = sub.add_parser("impls"); p.add_argument("--axis", default=None); p.set_defaults(fn=cmd_impls)
-    p = sub.add_parser("adopt"); p.add_argument("--id", required=True); p.set_defaults(fn=cmd_adopt)
+    p = sub.add_parser("apply"); p.add_argument("--id", required=True)
+    p.add_argument("--dry", action="store_true", help="print the genome/diff without applying")
+    p.set_defaults(fn=cmd_apply)
 
     args = ap.parse_args(argv)
     root = find_root(args.root)

@@ -1,11 +1,16 @@
 """Build the inventor brief context — the ONE channel every mutation operator receives.
 
 Everything selection-relevant that should shape a proposal is injected here
-deterministically (leaderboard, frontier, inspiration code worst→best, do-not-resubmit,
-insights, standing rules, the parent's text_feedback), so heterogeneous inventors —
-Claude subagents, external CLI agents — get identical grounding (that identical brief is
-what makes mixing them genuine diversity rather than an apples-to-oranges comparison).
+deterministically (leaderboard, inspiration code worst→best, do-not-resubmit, insights,
+standing rules, the parent's text_feedback), so heterogeneous inventors — Claude
+subagents, external CLI agents — get identical grounding (that identical brief is what
+makes mixing them genuine diversity rather than an apples-to-oranges comparison).
 Private metrics never pass through here: this module is the anti-overfit choke point.
+
+The inventor's stated objective is its PARENT: search is scoring + parent selection +
+breeding, and whatever a brief makes load-bearing is the objective inventors actually
+optimize — naming a single best-so-far here made whole rounds mutate one lineage
+regardless of their assigned parents (measured: 5/6 inventors in one round).
 """
 
 import pathlib
@@ -55,19 +60,6 @@ def leaderboard_block(root, axis=None, top=10, selection_env=None):
         "\n".join(_one_liner(r, axis) for r in lb)
 
 
-def frontier_block(root, selection_env=None):
-    champ = archive.best(root, selection_env)
-    if not champ:
-        return "CURRENT FRONTIER: (archive empty)"
-    recipe = surface.genome_recipe(champ["genome"]) if isinstance(champ.get("genome"), dict) \
-        else champ["surface"].get("patch", "see archived diff") if isinstance(champ.get("surface"), dict) else ""
-    lines = [f"CURRENT FRONTIER — the best candidate so far; a mutation replaces one mechanism and keeps the rest:",
-             f"  {champ['id']} (fitness {_fitness_str(champ)}, {champ.get('mode')}): {recipe}"]
-    if champ.get("text_feedback"):
-        lines.append(f"  its eval feedback: {champ['text_feedback'][:400]}")
-    return "\n".join(lines)
-
-
 def _candidate_code(root, cfg, record, axis=None):
     """The code a record represents: registry -> the axis impl file; markers -> the archived
     mutable-region snapshot."""
@@ -102,8 +94,12 @@ def inspirations_block(root, cfg, parent_id, axis=None, n_top=2, n_archive=2, se
     improvement gradient), with scores and eval feedback."""
     recs = archive.sample_inspirations(root, parent_id, n_top=n_top, n_archive=n_archive,
                                        seed=seed, selection_env=selection_env)
+    retired = surface.retired_impls(root)
     blocks, seen = [], set()
     for r in recs:
+        if retired and surface.genome_selects_retired(r.get("genome") or {}, retired):
+            continue   # a retired mechanism handed out as inspiration defeats the retirement
+
         code = _candidate_code(root, cfg, r, axis)
         if code and code not in seen:
             seen.add(code)
@@ -114,8 +110,8 @@ def inspirations_block(root, cfg, parent_id, axis=None, n_top=2, n_archive=2, se
         return ""
     blocks.sort(key=lambda b: b[0])  # worst -> best
     sep = "-" * 80
-    return ("INSPIRATIONS — archived candidates, worst to best. Study them; your job is to BEAT "
-            f"the best (build on, recombine, or out-invent — do NOT re-derive them):\n{sep}\n"
+    return ("INSPIRATIONS — archived candidates, worst to best: mechanisms already explored. "
+            f"Study them so you don't re-derive one; your job is to beat your PARENT:\n{sep}\n"
             + "\n\n".join(b[1] for b in blocks) + f"\n{sep}")
 
 
@@ -137,9 +133,10 @@ def insights_block(root):
 
 def parent_block(root, cfg, parent_record, axis=None):
     if parent_record is None:
-        return "PARENT: the seed program (unmodified baseline)."
+        return "PARENT: the seed program (unmodified baseline). Your objective: beat its fitness."
     lines = [f"PARENT — you are mutating this candidate ({parent_record['id']}, "
-             f"fitness {_fitness_str(parent_record)}):"]
+             f"fitness {_fitness_str(parent_record)}). Your objective: beat THIS fitness — "
+             "the comparison that matters is child vs parent:"]
     code = _candidate_code(root, cfg, parent_record, axis)
     if code:
         lines.append(code)
@@ -188,7 +185,6 @@ def build(root, cfg, *, operator="diff", parent_id=None, axis=None, cross_with=N
                         + (code or f"  recipe: {surface.genome_recipe(partner.get('genome', {}))}"))
     sections += [
         leaderboard_block(root, axis, selection_env=sel_env),
-        frontier_block(root, selection_env=sel_env),
         inspirations_block(root, cfg, parent_id, axis,
                            n_top=cfg["search"]["inspirations"]["top_k"],
                            n_archive=cfg["search"]["inspirations"]["archive"], seed=seed,

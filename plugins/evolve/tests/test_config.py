@@ -16,7 +16,7 @@ class TestConfig(unittest.TestCase):
     def test_load_and_defaults(self):
         cfg = cfgmod.load(self.root)
         self.assertEqual(cfg["surface"]["mode"], "markers")
-        self.assertEqual(cfg["search"]["lambda"], 10.0)         # explicit
+        self.assertEqual(cfg["search"]["lambda"], "auto")       # from the toy config
         self.assertIsNone(cfg["eval"]["setup"])                 # default filled
 
     def test_missing_config(self):
@@ -47,6 +47,40 @@ class TestConfig(unittest.TestCase):
         (self.root / "evolve" / "evolve.json").write_text(json.dumps(cfg))
         with self.assertRaises(cfgmod.ConfigError):
             cfgmod.load(self.root)
+
+    def test_lambda_accepts_auto_null_and_numbers_only(self):
+        cfg = cfgmod.load(self.root)
+        for ok in ("auto", None, 0, 25.0):
+            cfg["search"]["lambda"] = ok
+            cfgmod.validate(cfg, self.root)
+        for bad in ("bogus", -1, True, float("inf")):
+            cfg["search"]["lambda"] = bad
+            with self.assertRaises(cfgmod.ConfigError):
+                cfgmod.validate(cfg, self.root)
+
+    def test_inventor_files_must_be_repo_relative(self):
+        cfg = cfgmod.load(self.root)
+        cfg["surface"] = {"mode": "registry", "files": [], "registry": {
+            "dir": "evolve/chunks",
+            "axes": {"objective": {"baseline": "baseline"}},
+            "inventor_files": ["../outside.py"]}}
+        with self.assertRaises(cfgmod.ConfigError):
+            cfgmod.validate(cfg, self.root)
+        cfg["surface"]["registry"]["inventor_files"] = ["/abs/path.py"]
+        with self.assertRaises(cfgmod.ConfigError):
+            cfgmod.validate(cfg, self.root)
+        cfg["surface"]["registry"]["inventor_files"] = ["ok/nested.py"]
+        cfgmod.validate(cfg, self.root)
+
+    def test_absent_budget_block_means_unlimited(self):
+        p = self.root / "evolve" / "evolve.json"
+        raw = json.loads(p.read_text())
+        del raw["budget"]
+        p.write_text(json.dumps(raw))
+        self.assertEqual(cfgmod.load(self.root)["budget"], {})   # removal = no limits, not defaults
+        raw["budget"] = {"max_generations": 7}
+        p.write_text(json.dumps(raw))                            # a partial block is taken verbatim
+        self.assertEqual(cfgmod.load(self.root)["budget"], {"max_generations": 7})
 
     def test_save_backs_up(self):
         cfg = cfgmod.load(self.root)
