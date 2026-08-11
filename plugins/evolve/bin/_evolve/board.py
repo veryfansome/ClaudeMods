@@ -45,13 +45,21 @@ def report(root, cfg, top=10, include_pruned=False):
     if len(commits) > 1:
         warnings.append(f"scored candidates span {len(commits)} HEAD commits — the frozen baseline "
                         "shifted mid-campaign; fitnesses from different commits are not comparable")
+    # --all APPENDS every pruned candidate after the top rows: merging them into one
+    # ranking and then slicing [:top] hides exactly the rows --all promises to show
+    # (pruned candidates are dominated by construction, so they never make the cutoff).
+    rows = archive.leaderboard(root, top, sel_env)
+    if include_pruned and pruned:
+        by_id = {r["id"]: r for r in archive.best_per_id(archive.valid(recs, sel_env))}
+        rows += sorted((by_id[i] for i in sorted(pruned) if i in by_id),
+                       key=lambda r: (r.get("mode") == "full", r["fitness"]), reverse=True)
     return {
         "leaderboard": [
             {"id": r["id"], "fitness": r["fitness"], "mode": r.get("mode"),
              "generation": r.get("generation"), "inventor": r.get("inventor"),
              "operator": r.get("operator"), "env": r.get("env"), "rationale": r.get("rationale"),
              **({"pruned": True} if r["id"] in pruned else {})}
-            for r in archive.leaderboard(root, top, sel_env, include_pruned=include_pruned)
+            for r in rows
         ],
         # Pruned = out of selection, NOT out of history: scores stay valid, `evolve apply`
         # still retrieves, reinstatement needs no re-measurement.

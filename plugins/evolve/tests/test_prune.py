@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 
-from _toy import PLUGIN, make_registry_project, cleanup
+from _toy import PLUGIN, make_registry_project, cleanup, git
 from _evolve import archive, board, config as cfgmod, diet, prune, rounds, score
 
 
@@ -64,11 +64,26 @@ class TestPrunedView(unittest.TestCase):
 
     def test_prune_survives_pinning_selection_env(self):
         # Review major: a prune made while selection_env was UNSET must keep biting after
-        # the owner pins it. cmd_prune inherits the record's env from the id's own pool
-        # record (here "e1"), so both views agree.
+        # the owner pins it. cmd_prune resolves the record's env from the id's own
+        # measurement records (here "e1"), so both views agree.
         recs = [rec("a", 1.0, {"x": "i1"}), prune_rec("a", env="e1")]
         self.assertIn("a", archive.pruned_ids(recs, None))    # unpinned: prune bites
         self.assertIn("a", archive.pruned_ids(recs, "e1"))    # pinned to the pool's env: still bites
+
+    def test_streams_are_per_partition(self):
+        # Final-review major: prune records are per-(id, env) STREAMS. A reinstate scoped
+        # to one partition must not erase another partition's standing prune from any view.
+        recs = [rec("a", 1.0, {"x": "i1"}, env="e1"), rec("a", 0.8, {"x": "i1"}, env="e2"),
+                prune_rec("a", env="e1"), prune_rec("a", env="e2"),
+                prune_rec("a", on=False, reason="back in e1", env="e1")]
+        self.assertNotIn("a", archive.pruned_ids(recs, "e1"))      # e1 stream reversed
+        self.assertIn("a", archive.pruned_ids(recs, "e2"))         # e2 stream STANDS
+        self.assertIn("a", archive.pruned_ids(recs, None))         # union sees it
+        self.assertIn("a", archive.pruned_ids(recs, "e1", cross_partition=True))  # global too
+        recs.append(prune_rec("a", on=False, reason="back in e2", env="e2"))
+        self.assertEqual(archive.pruned_ids(recs, None), {})
+        self.assertEqual(archive.pruned_ids(recs, "e2", cross_partition=True), {})
+        self.assertEqual(prune.standing_streams(recs, "a"), {})
 
     def test_selection_pool_excludes_pruned_but_valid_keeps_them(self):
         recs = [rec("a", 1.0, {"x": "i1"}), rec("b", 2.0, {"x": "i1"}), prune_rec("a")]
@@ -276,10 +291,16 @@ class TestCoverageRule(unittest.TestCase):
         self.assertEqual(self._ids(prune.plan(recs, cfg, min_carriers=2)), ["a"])
         recs.append(prune_rec("a"))
         self.assertEqual(prune.audit(recs, cfg, min_carriers=2)["voided"], [])
-        # A later retraction wave thins a's carriers — the standing certificate is void.
+        # Retracting one carrier THINS coverage (diversity collapses) but every trait and
+        # pair is still carried somewhere: voided, trait_lost False — doctor warns only.
+        recs.append(retract_rec("e"))
+        aud = prune.audit(recs, cfg, min_carriers=2)
+        self.assertEqual([(v["id"], v["trait_lost"]) for v in aud["voided"]], [("a", False)])
+        # Retracting the rest of the (i1,i2) pair's carriers LOSES it from the pool
+        # entirely: the "never traits" invariant is broken — doctor's check fails.
         recs += [retract_rec("b"), retract_rec("c")]
         aud = prune.audit(recs, cfg, min_carriers=2)
-        self.assertEqual([v["id"] for v in aud["voided"]], ["a"])
+        self.assertEqual([(v["id"], v["trait_lost"]) for v in aud["voided"]], [("a", True)])
 
     def test_audit_skips_retracted_and_reports_unauditable(self):
         recs = self._pool(("a", 0.5, {"x": "i1", "y": "by", "z": "bz"}))
@@ -338,6 +359,8 @@ class TestCliFlows(unittest.TestCase):
         ap = archive.archive_path(cls.root)
         ap.parent.mkdir(parents=True, exist_ok=True)
         ap.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        git(["add", "-A"], cls.root)          # clones export HEAD: impls must be committed
+        git(["commit", "-q", "-m", "pool"], cls.root)
 
     @classmethod
     def tearDownClass(cls):
@@ -353,6 +376,10 @@ class TestCliFlows(unittest.TestCase):
         self._cli("prune", "--ids", "nope", "--reason", "r", expect=1)         # unknown id
         self._cli("prune", "--ids", "seed0", "--reason", "r", expect=1)        # rootless
         self._cli("prune", "--ids", "k2,seed0", "--reason", "r", expect=1)     # batch atomic
+        _, err = self._cli("prune", "--ids", "k2", "--reason", "r",
+                           "--min-carriers", "0", expect=1)                    # graceful, not a traceback
+        self.assertIn("min-carriers", err)
+        self._cli("prune", "--plan", "--min-carriers", "-2", expect=1)
         self.assertEqual(archive.pruned_ids(archive.load(self.root)), {})
 
     def test_2_prune_apply_effect_and_board(self):
@@ -412,6 +439,14 @@ class TestCliFlows(unittest.TestCase):
         self.assertNotIn("k3", archive.pruned_ids(archive.load(self.root)))
         self._cli("prune", "--id", "k3", "--reinstate", "--reason", "again", expect=1)
 
+    def test_6b_reinstate_of_retracted_id_says_so(self):
+        # k2 is pruned (test_2) AND retracted (test_4): reversing the prune must not
+        # claim a selection re-entry the retraction still blocks.
+        out, _ = self._cli("prune", "--id", "k2", "--reinstate", "--reason", "undo prune")
+        payload = json.loads(out)
+        self.assertIn("retracted", payload["note"])
+        self.assertNotIn("k2", archive.pruned_ids(archive.load(self.root)))
+
     def test_7_plan_respects_pool_and_protections(self):
         out, _ = self._cli("prune", "--plan")
         plan = json.loads(out)
@@ -424,8 +459,52 @@ class TestCliFlows(unittest.TestCase):
             {"slot": 0, "parent": "k1", "operator": "diff", "cross_with": None, "seed": "s"}])
         out, _ = self._cli("prune", "--ids", "k1", "--reason", "test in-flight warning")
         payload = json.loads(out)
-        self.assertTrue(any("slot 0" in w for w in payload["warnings"]))
+        # One AGGREGATED warning per id (a campaign's dead rounds must not flood the ceremony)
+        self.assertEqual(len(payload["warnings"]), 1)
+        self.assertIn("persisted parent/partner", payload["warnings"][0])
+        self.assertIn("slot0", payload["warnings"][0])
         self._cli("prune", "--id", "k1", "--reinstate", "--reason", "undo")
+
+    def test_9a_multi_env_id_refused_on_unpinned_project(self):
+        # Final-review major: on an unpinned project a prune's partition is resolved from
+        # the id's measurement records; several envs = ambiguous evidence = refuse.
+        archive.append(self.root, rec("k4", 1.5, {"objective": "i1"}, parent="seed0", env="x1"))
+        archive.append(self.root, rec("k4", 1.4, {"objective": "i1"}, parent="seed0", env="x2"))
+        _, err = self._cli("prune", "--ids", "k4", "--reason", "r", expect=1)
+        self.assertIn("span several envs", err)
+        self.assertEqual(archive.pruned_ids(archive.load(self.root)), {})
+
+    def test_9b_reinstate_refuses_ambiguous_streams(self):
+        for env in ("x1", "x2"):
+            archive.append(self.root, {"id": "k4", "prune": True, "reason": "r", "env": env})
+        _, err = self._cli("prune", "--id", "k4", "--reinstate", "--reason", "r", expect=1)
+        self.assertIn("several partitions", err)
+        # both streams still stand — the refusal reversed nothing
+        self.assertEqual(set(prune.standing_streams(archive.load(self.root), "k4")),
+                         {"x1", "x2"})
+        for env in ("x1", "x2"):   # clean up both streams explicitly
+            archive.append(self.root, {"id": "k4", "prune": False, "reason": "undo", "env": env})
+
+    def test_9c_score_paths_note_the_standing_prune(self):
+        archive.append(self.root, rec("k5", 1.7, {"objective": "i1"}, parent="seed0", env=None))
+        self._cli("prune", "--ids", "k5", "--reason", "covered")
+        # retract, then recover via ingest --reinstate: the un-retract must still say the
+        # id stays pruned (final-review: the note was dead on exactly this path)
+        score.ingest(self.root, self.cfg,
+                     result_text=json.dumps({"retract": True, "fitness": None,
+                                             "guardrail": "post-hoc"}),
+                     meta={"id": "k5"}, mode="full", split="inner")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            score.ingest(self.root, self.cfg, result_text=json.dumps({"fitness": 1.71}),
+                         meta={"id": "k5"}, mode="full", split="inner", reinstate=True)
+        self.assertIn("does NOT reinstate", err.getvalue())
+        # rescore (the other documented recovery path) says it too
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            score.rescore(self.root, self.cfg, rec_id="k5", mode="proxy")
+        self.assertIn("does NOT reinstate", err.getvalue())
+        self.assertIn("k5", archive.pruned_ids(archive.load(self.root)))
 
 
 if __name__ == "__main__":

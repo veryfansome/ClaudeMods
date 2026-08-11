@@ -245,23 +245,28 @@ def pruned_ids(records, selection_env=None, cross_partition=False):
     Reinstatement is explicit (prune: false) and needs no re-measurement. Unlike
     retraction, a later score does NOT reinstate: new data says nothing about
     redundancy, which is a judgment about the POOL, not about the candidate's number.
-    Scope mirrors retracted_ids for the opposite reason retraction earned cross-partition
-    default: the coverage evidence is a fitness comparison and fitness is
-    partition-scoped, so a prune bites in the partition whose pool justified it (its env
-    tag); cross_partition=True is the global view (e.g. a cutover roster deciding what
-    to re-measure)."""
-    env = None if cross_partition else selection_env
-    out = {}
+
+    SCOPE: prune records form independent per-(id, env) STREAMS — the coverage evidence
+    is a fitness comparison and fitness is partition-scoped, so a prune stands or falls
+    only against records tagged with ITS env. A pinned view (selection_env set) reads
+    exactly that partition's stream. The unpinned view and cross_partition=True are the
+    UNION of standing streams: an id is pruned if ANY partition's verdict stands —
+    collapsing streams by id alone was measured wrong in review (a reinstate scoped to
+    one partition erased another partition's standing prune from the global view the
+    cutover roster reads)."""
+    streams = {}
     for r in records:
         rid = r.get("id")
         if rid is None or not isinstance(r.get("prune"), bool):
             continue
-        if env is not None and r.get("env") != env:
+        streams[(rid, r.get("env"))] = (r["prune"], str(r.get("reason") or "pruned"))
+    out = {}
+    for (rid, env), (standing, reason) in streams.items():
+        if not standing:
             continue
-        if r["prune"]:
-            out[rid] = str(r.get("reason") or "pruned")
-        else:
-            out.pop(rid, None)
+        if not cross_partition and selection_env is not None and env != selection_env:
+            continue
+        out[rid] = reason
     return out
 
 

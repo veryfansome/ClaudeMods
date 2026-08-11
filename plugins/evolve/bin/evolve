@@ -264,6 +264,9 @@ def cmd_prune(root, args):
     cfg = cfgmod.load(root)
     sel_env = cfg["fitness"].get("selection_env")
     recs = archive.load(root)
+    if args.min_carriers < 1:
+        _fail(f"--min-carriers must be >= 1 (got {args.min_carriers}) — at 0 the "
+              "sole-carrier immortality guarantee would be vacuous")
     if args.plan:
         if cfg["surface"]["mode"] != "registry":
             _fail("prune --plan reasons over genome traits and needs a registry-mode project; "
@@ -274,27 +277,36 @@ def cmd_prune(root, args):
         if not args.id or not args.reason:
             _fail("--reinstate needs --id and --reason (the audit trail for why the candidate "
                   "re-enters selection)")
-        here = archive.pruned_ids(recs, sel_env)
-        if args.id not in here:
-            everywhere = archive.pruned_ids(recs, cross_partition=True)
-            if args.id in everywhere:
-                _fail(f"id {args.id!r} is pruned, but not in the current selection scope "
-                      f"(selection_env {sel_env!r}) — its prune record carries another env "
-                      "tag; reinstate from a checkout configured for that partition")
-            _fail(f"id {args.id!r} is not pruned — nothing to reinstate (a no-op reinstate "
-                  "would record a decision that changes nothing)")
-        # The reinstate must land in the SAME scope as the prune it reverses — stamping the
-        # config's current selection_env instead would strand the pair in different
-        # partitions the moment the config moves.
-        prune_env = prune.last_prune_records(recs, sel_env)[args.id].get("env")
+        # Prune records are per-partition STREAMS: reverse exactly one, never guess.
+        standing = prune.standing_streams(recs, args.id)
+        if not standing:
+            _fail(f"id {args.id!r} is not pruned anywhere — nothing to reinstate (a no-op "
+                  "reinstate would record a decision that changes nothing)")
+        if sel_env is not None:
+            if sel_env not in standing:
+                _fail(f"id {args.id!r} has no standing prune in the current selection scope "
+                      f"(selection_env {sel_env!r}; standing in: {sorted(map(repr, standing))})"
+                      " — reinstate from a checkout pinned to the partition you mean")
+            target_env = sel_env
+        elif len(standing) > 1:
+            _fail(f"id {args.id!r} has standing prunes in several partitions "
+                  f"({sorted(map(repr, standing))}) — pin fitness.selection_env to the "
+                  "partition you mean; an unpinned reinstate would reverse one and leave "
+                  "the others silently standing")
+        else:
+            target_env = next(iter(standing))
         archive.append(root, {"id": args.id, "prune": False, "reason": args.reason,
-                              "env": prune_env})
+                              "env": target_env})
         if args.id in archive.pruned_ids(archive.load(root), sel_env):
             _fail(f"reinstate record appended but {args.id!r} still reads as pruned — inspect "
                   "the archive (this should be unreachable)")
-        print(json.dumps({"reinstated": args.id, "env": sel_env,
-                          "note": "back in selection: parents, partners, inspirations, board"},
-                         indent=1))
+        # Don't claim a selection re-entry that other statuses still block.
+        verdict = archive.retracted_ids(recs, sel_env).get(args.id)
+        note = ("prune reversed, but the id remains OUT of selection — it is retracted "
+                f"({verdict}); a deliberate rescore or `ingest --reinstate` returns it"
+                if verdict is not None else
+                "back in selection: parents, partners, inspirations, board")
+        print(json.dumps({"reinstated": args.id, "env": target_env, "note": note}, indent=1))
         return
     if not args.ids or not args.reason:
         _fail("prune needs one of: --plan | --ids a,b,... --reason ... | "
@@ -305,7 +317,7 @@ def cmd_prune(root, args):
     pool = {r["id"]: r for r in archive.selection_pool(recs, sel_env)}
     already = archive.pruned_ids(recs, sel_env)
     retracted = archive.retracted_ids(recs, sel_env)
-    problems = []
+    problems, stamp_env = [], {}
     for rid in ids:
         if rid in already:
             problems.append(f"{rid}: already pruned")
@@ -321,6 +333,24 @@ def cmd_prune(root, args):
             problems.append(f"{rid}: rootless (no parent — the partition baseline). The "
                             "baseline is never pruned: a re-measurement roster needs it "
                             "whatever else it omits")
+        elif sel_env is not None:
+            # Pinned: the prune is judged against THIS partition's pool — stamp it, don't
+            # infer it (best_per_id's authoritative record can carry a foreign env).
+            stamp_env[rid] = sel_env
+        else:
+            # Unpinned: resolve the partition from the id's measurement records, exactly
+            # like a retraction resolves the scope it cleans — and refuse ambiguity: a
+            # prune judged against a mixed pool has incomparable-fitness evidence.
+            envs = {r.get("env") for r in recs
+                    if r.get("id") == rid and "prune" not in r
+                    and r.get("split", "inner") != "final"}
+            if len(envs) > 1:
+                problems.append(f"{rid}: records span several envs "
+                                f"({sorted(map(repr, envs))}) and the project is unpinned — "
+                                "set fitness.selection_env to the partition this prune is "
+                                "judged against")
+            else:
+                stamp_env[rid] = next(iter(envs))
     if problems:
         _fail("refusing the whole batch (a partial prune would leave the plan half-applied):"
               "\n  ! " + "\n  ! ".join(problems))
@@ -328,7 +358,10 @@ def cmd_prune(root, args):
     # has a re-brief/respawn path that will now fail closed until the round completes or
     # the id is reinstated. Scoring/ingesting the slot's CHILDREN is unaffected (lineage
     # does not read the pool).
-    warnings = []
+    # Aggregate per id: a long campaign accumulates slots files from long-finished rounds
+    # (203 hits measured on the field project), and a flood buries the one genuinely
+    # in-flight warning. The engine can't know which rounds ended — the operator can.
+    hits = {}
     rdir = rounds.rounds_dir(root)
     for f in sorted(rdir.glob("*-slots.json")) if rdir.is_dir() else []:
         try:
@@ -336,19 +369,15 @@ def cmd_prune(root, args):
         except (ValueError, AttributeError):
             continue
         for s in slots:
-            hit = {s.get("parent"), s.get("cross_with")} & set(ids)
-            for rid in sorted(h for h in hit if h):
-                warnings.append(f"{rid} is slot {s.get('slot')}'s "
-                                f"{'parent' if s.get('parent') == rid else 'partner'} in "
-                                f"{f.name} — if that round is in flight, its re-brief path "
-                                "fails closed until reinstate or round end")
+            for rid in {s.get("parent"), s.get("cross_with")} & set(ids):
+                hits.setdefault(rid, []).append(f"{f.name}#slot{s.get('slot')}")
+    warnings = [f"{rid} is a persisted parent/partner in {len(where)} slot assignment(s) "
+                f"(latest: {where[-1]}) — for any round still in flight, that slot's "
+                "re-brief path fails closed until reinstate or round end"
+                for rid, where in sorted(hits.items())]
     for rid in ids:
-        # env is INHERITED from the id's own pool record, exactly like a retraction
-        # resolves its scope from the records it cleans — stamping the config's raw
-        # selection_env (null on an unpinned project) writes a record that stops biting
-        # the moment the owner pins the env, silently reversing every standing prune.
         archive.append(root, {"id": rid, "prune": True, "reason": args.reason,
-                              "env": pool[rid].get("env"),
+                              "env": stamp_env[rid],
                               "min_carriers": args.min_carriers})
     now = archive.pruned_ids(archive.load(root), sel_env)
     missing = [rid for rid in ids if rid not in now]

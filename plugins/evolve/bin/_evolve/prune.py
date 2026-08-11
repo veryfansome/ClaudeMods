@@ -125,6 +125,9 @@ def _pool_maps(pool):
 def plan(records, cfg, min_carriers=3):
     """Compute the prunable set. Writes nothing — applying is `evolve prune --ids`,
     a separate owner decision."""
+    if not isinstance(min_carriers, int) or isinstance(min_carriers, bool) or min_carriers < 1:
+        raise ValueError(f"min_carriers must be a positive integer, got {min_carriers!r} — "
+                         "at 0 the sole-carrier immortality guarantee would be vacuous")
     sel_env = cfg["fitness"].get("selection_env")
     floor = cfg["fitness"].get("noise_floor")
     warnings = []
@@ -159,18 +162,22 @@ def plan(records, cfg, min_carriers=3):
             "warnings": warnings}
 
 
-def last_prune_records(records, selection_env=None, cross_partition=False):
-    """id -> its LAST prune-shaped record, same scoping as archive.pruned_ids — the
-    certificate parameters (min_carriers) ride on the record, so the audit can re-check
-    each prune against the bar it was actually made with."""
-    env = None if cross_partition else selection_env
+def prune_streams(records):
+    """(id, env) -> the stream's LAST prune-shaped record. Prune records form
+    independent per-partition streams (see archive.pruned_ids); certificate parameters
+    (min_carriers) ride on the record, so the audit re-checks each prune against the
+    bar it was actually made with."""
     out = {}
     for r in records:
         if isinstance(r.get("prune"), bool) and r.get("id") is not None:
-            if env is not None and r.get("env") != env:
-                continue
-            out[r["id"]] = r
+            out[(r["id"], r.get("env"))] = r
     return out
+
+
+def standing_streams(records, rid):
+    """env -> the standing (prune: true) record for one id, across all partitions."""
+    return {env: r for (i, env), r in prune_streams(records).items()
+            if i == rid and r["prune"]}
 
 
 def audit(records, cfg, min_carriers=3):
@@ -179,7 +186,9 @@ def audit(records, cfg, min_carriers=3):
     fallback for records that predate the field). A prune whose carriers were since
     retracted, re-scored downward or themselves pruned no longer keeps its promise
     ('traits carried at-least-as-well elsewhere') — report it; reinstating is the
-    owner's call, never this function's."""
+    owner's call, never this function's. Each voided entry carries trait_lost: True when
+    a trait or pair has ZERO surviving carriers — the hard "never traits" invariant is
+    broken, not merely thinned — which is the distinction doctor gates on."""
     sel_env = cfg["fitness"].get("selection_env")
     pruned = archive.pruned_ids(records, sel_env)
     if not pruned:
@@ -190,7 +199,7 @@ def audit(records, cfg, min_carriers=3):
     traits_by_id, fit_by_id, _, div_need, ordered_ids = _pool_maps(pool)
     survivor_ids = {r["id"] for r in pool}
     retracted = archive.retracted_ids(records, sel_env)
-    prune_recs = last_prune_records(records, sel_env)
+    streams = prune_streams(records)
     voided, unauditable = [], []
     for rid in sorted(pruned):
         if rid in retracted:
@@ -206,11 +215,24 @@ def audit(records, cfg, min_carriers=3):
             continue
         # Each standing prune is judged independently against the survivors — the same
         # question the plan asked, re-asked now: would the current pool still cover it?
+        # The bar: the id's standing stream in this partition; unpinned, the STRICTEST
+        # standing bar across partitions (conservative — flags more, hides nothing).
+        if sel_env is not None:
+            bars = [(streams.get((rid, sel_env)) or {}).get("min_carriers")]
+        else:
+            bars = [r.get("min_carriers") for (i, _), r in streams.items()
+                    if i == rid and r["prune"]]
+        d = max((int(b) for b in bars if b), default=min_carriers)
         tb = dict(traits_by_id, **{rid: mine})
         fb = dict(fit_by_id, **{rid: rec["fitness"]})
-        d = int((prune_recs.get(rid) or {}).get("min_carriers") or min_carriers)
         why, _ = _coverage(rid, rec["fitness"], tb, fb, ordered_ids, survivor_ids,
                            min_carriers=d, floor=floor, div_need=div_need)
         if why is not None:
-            voided.append({"id": rid, "why": why})
+            # trait_lost is ABSOLUTE (any-fitness carriage), not margin-relative: a trait
+            # carried only far below the pruned candidate is thinned, not gone.
+            lost = (any(not any(t in traits_by_id[o] for o in ordered_ids) for t in mine)
+                    or any(not any(pa in traits_by_id[o] and pb in traits_by_id[o]
+                                   for o in ordered_ids)
+                           for pa, pb in itertools.combinations(sorted(mine), 2)))
+            voided.append({"id": rid, "why": why, "trait_lost": lost})
     return {"pruned": len(pruned), "voided": voided, "unauditable": unauditable}
