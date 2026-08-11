@@ -48,6 +48,11 @@ STANDING_TERMS = [
     (re.compile(r"\bleaderboards?\b|\bboard[- ]tops?\b", re.I), "prior work"),
     (re.compile(r"\bfrontier\b", re.I), "prior work"),
     (re.compile(r"\b(?:beat|beats|beating)\s+the\s+best\b", re.I), "beat your parent"),
+    # Prune status is relative standing too ("we pruned X" says X was judged redundant
+    # against the pool). The engine never writes it into a brief; this catches
+    # owner-authored notes/standing rules, the measured leak source. Accepts the false
+    # positive on legitimate uses (decision-tree pruning) — the diet is conservative.
+    (re.compile(r"\bprun(?:e|es|ed|ing)\b", re.I), "set aside"),
 ]
 
 
@@ -113,6 +118,21 @@ def build(root, cfg, *, operator="diff", parent_id=None, axis=None, cross_with=N
     recs = archive.load(root)
     in_scope = archive.latest_valid(recs, sel_env)
 
+    # Pruned parent/partner fails closed FIRST — before any other resolution — so a stale
+    # slot assignment surfaces as this message, not as a downstream lookup error. The text
+    # reaches the ORCHESTRATOR (stderr; no brief is emitted), so naming the status is not
+    # an inventor leak. Distinct from retraction on purpose: the score is still true — the
+    # candidate just left selection, and the remedy is resample-or-reinstate, not rescore.
+    # Retraction OUTRANKS prune (a pruned-then-retracted id is not in in_scope): it falls
+    # through to the validity error below — telling that owner to reinstate a prune would
+    # prescribe a dead end, since the retraction still blocks.
+    pruned = archive.pruned_ids(recs, sel_env)
+    for role, rid in (("parent", parent_id), ("crossover partner", cross_with)):
+        if rid and rid in pruned and rid in in_scope:
+            raise ValueError(f"{role} {rid!r} is pruned ({pruned[rid]}) — its score stays "
+                             "valid but the engine no longer offers it to selection. Resample "
+                             "the slot; if this candidate specifically must be bred, reinstate "
+                             "it first (`evolve prune --id ... --reinstate --reason ...`)")
     parent = in_scope.get(parent_id)
     if parent is None:
         raise ValueError(f"parent {parent_id!r} has no VALID record"

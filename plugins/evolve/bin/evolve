@@ -29,7 +29,13 @@ inventors; this CLI decides. Verbs:
   retract         append an explicit retraction for an archived id: its earlier scores stop
                   counting (in every partition — a validity verdict is a property of the
                   mechanism, not the dataset); history stays; a deliberate rescore reinstates
-  board           leaderboard + budget + neutral per-inventor/operator stats
+  prune           remove redundant VEHICLES from selection, never traits: --plan computes
+                  the trait-coverage set (every trait AND every trait-pair carried
+                  at-least-as-well by diverse others), --ids applies the owner-approved
+                  list, --reinstate returns one — all append-only; scores stay valid,
+                  dedup/lineage/apply untouched; doctor re-audits every standing prune
+  board           leaderboard + budget + neutral per-inventor/operator stats; --all also
+                  shows pruned candidates
   impls           list registered impls for a registry axis
   apply           materialize an archived candidate: print its genome (registry) or apply
                   its patch to the working tree (markers); --dry prints without applying.
@@ -50,7 +56,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from _evolve import archive, board, brief, config as cfgmod, diet, doctor, jail, rounds, runner, scaffold, score, surface  # noqa: E402
+from _evolve import archive, board, brief, config as cfgmod, diet, doctor, jail, prune, rounds, runner, scaffold, score, surface  # noqa: E402
 
 
 def find_root(explicit):
@@ -252,9 +258,113 @@ def cmd_retract(root, args):
                               "the global view"}, indent=1))
 
 
+def cmd_prune(root, args):
+    """Success is judged by EFFECT, like retract: the status must actually register in the
+    view every consumer reads, never just "the append went through"."""
+    cfg = cfgmod.load(root)
+    sel_env = cfg["fitness"].get("selection_env")
+    recs = archive.load(root)
+    if args.plan:
+        if cfg["surface"]["mode"] != "registry":
+            _fail("prune --plan reasons over genome traits and needs a registry-mode project; "
+                  "markers-mode candidates can still be pruned explicitly via --ids", code=2)
+        print(json.dumps(prune.plan(recs, cfg, min_carriers=args.min_carriers), indent=1))
+        return
+    if args.reinstate:
+        if not args.id or not args.reason:
+            _fail("--reinstate needs --id and --reason (the audit trail for why the candidate "
+                  "re-enters selection)")
+        here = archive.pruned_ids(recs, sel_env)
+        if args.id not in here:
+            everywhere = archive.pruned_ids(recs, cross_partition=True)
+            if args.id in everywhere:
+                _fail(f"id {args.id!r} is pruned, but not in the current selection scope "
+                      f"(selection_env {sel_env!r}) — its prune record carries another env "
+                      "tag; reinstate from a checkout configured for that partition")
+            _fail(f"id {args.id!r} is not pruned — nothing to reinstate (a no-op reinstate "
+                  "would record a decision that changes nothing)")
+        # The reinstate must land in the SAME scope as the prune it reverses — stamping the
+        # config's current selection_env instead would strand the pair in different
+        # partitions the moment the config moves.
+        prune_env = prune.last_prune_records(recs, sel_env)[args.id].get("env")
+        archive.append(root, {"id": args.id, "prune": False, "reason": args.reason,
+                              "env": prune_env})
+        if args.id in archive.pruned_ids(archive.load(root), sel_env):
+            _fail(f"reinstate record appended but {args.id!r} still reads as pruned — inspect "
+                  "the archive (this should be unreachable)")
+        print(json.dumps({"reinstated": args.id, "env": sel_env,
+                          "note": "back in selection: parents, partners, inspirations, board"},
+                         indent=1))
+        return
+    if not args.ids or not args.reason:
+        _fail("prune needs one of: --plan | --ids a,b,... --reason ... | "
+              "--id X --reinstate --reason ...")
+    ids = [s for s in (x.strip() for x in args.ids.split(",")) if s]
+    if not ids:
+        _fail("--ids is empty")
+    pool = {r["id"]: r for r in archive.selection_pool(recs, sel_env)}
+    already = archive.pruned_ids(recs, sel_env)
+    retracted = archive.retracted_ids(recs, sel_env)
+    problems = []
+    for rid in ids:
+        if rid in already:
+            problems.append(f"{rid}: already pruned")
+        elif rid in retracted:
+            problems.append(f"{rid}: retracted — already out of selection everywhere; "
+                            "pruning it would record a decision that changes nothing")
+        elif rid not in pool:
+            known = any(r.get("id") == rid for r in recs)
+            problems.append(f"{rid}: " + ("no valid record in the current selection scope "
+                                          f"(selection_env {sel_env!r}) — nothing to prune"
+                                          if known else "no archived record with this id"))
+        elif not pool[rid].get("parent"):
+            problems.append(f"{rid}: rootless (no parent — the partition baseline). The "
+                            "baseline is never pruned: a re-measurement roster needs it "
+                            "whatever else it omits")
+    if problems:
+        _fail("refusing the whole batch (a partial prune would leave the plan half-applied):"
+              "\n  ! " + "\n  ! ".join(problems))
+    # In-flight-round warning: a persisted slot assignment naming this id as parent/partner
+    # has a re-brief/respawn path that will now fail closed until the round completes or
+    # the id is reinstated. Scoring/ingesting the slot's CHILDREN is unaffected (lineage
+    # does not read the pool).
+    warnings = []
+    rdir = rounds.rounds_dir(root)
+    for f in sorted(rdir.glob("*-slots.json")) if rdir.is_dir() else []:
+        try:
+            slots = json.loads(f.read_text()).get("slots") or []
+        except (ValueError, AttributeError):
+            continue
+        for s in slots:
+            hit = {s.get("parent"), s.get("cross_with")} & set(ids)
+            for rid in sorted(h for h in hit if h):
+                warnings.append(f"{rid} is slot {s.get('slot')}'s "
+                                f"{'parent' if s.get('parent') == rid else 'partner'} in "
+                                f"{f.name} — if that round is in flight, its re-brief path "
+                                "fails closed until reinstate or round end")
+    for rid in ids:
+        # env is INHERITED from the id's own pool record, exactly like a retraction
+        # resolves its scope from the records it cleans — stamping the config's raw
+        # selection_env (null on an unpinned project) writes a record that stops biting
+        # the moment the owner pins the env, silently reversing every standing prune.
+        archive.append(root, {"id": rid, "prune": True, "reason": args.reason,
+                              "env": pool[rid].get("env"),
+                              "min_carriers": args.min_carriers})
+    now = archive.pruned_ids(archive.load(root), sel_env)
+    missing = [rid for rid in ids if rid not in now]
+    if missing:
+        _fail(f"prune records appended but {missing} do not read as pruned — inspect the "
+              "archive (this should be unreachable)")
+    print(json.dumps({"pruned": ids, "env": sel_env, "warnings": warnings,
+                      "note": "out of selection (parents, partners, inspirations, board "
+                              "default); scores stay valid, dedup/lineage/apply untouched; "
+                              "doctor re-audits coverage each run; reinstate with "
+                              "`evolve prune --id ... --reinstate --reason ...`"}, indent=1))
+
+
 def cmd_board(root, args):
     cfg = cfgmod.load(root)
-    rep = board.report(root, cfg, top=args.top)
+    rep = board.report(root, cfg, top=args.top, include_pruned=args.all)
     print(json.dumps(rep, indent=1) if args.json else board.render(rep))
 
 
@@ -406,7 +516,21 @@ def main(argv=None):
     p.add_argument("--split", default=cfgmod.DEFAULT_SPLIT)
     p.add_argument("--mode", default="proxy", choices=["proxy", "full"])
     p.set_defaults(fn=cmd_retract)
-    p = sub.add_parser("board"); p.add_argument("--top", type=int, default=10); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_board)
+    p = sub.add_parser("prune")
+    p.add_argument("--plan", action="store_true",
+                   help="compute the trait-coverage prunable set; prints evidence, writes nothing")
+    p.add_argument("--min-carriers", dest="min_carriers", type=int, default=3,
+                   help="D: carriers every single trait needs at fitness >= own - noise_floor")
+    p.add_argument("--ids", default=None, help="comma-separated ids to prune (owner-approved)")
+    p.add_argument("--id", default=None, help="id to reinstate (with --reinstate)")
+    p.add_argument("--reinstate", action="store_true",
+                   help="return a pruned id to selection — no re-measurement needed")
+    p.add_argument("--reason", default=None,
+                   help="the audit trail: why these candidates leave/re-enter selection")
+    p.set_defaults(fn=cmd_prune)
+    p = sub.add_parser("board"); p.add_argument("--top", type=int, default=10); p.add_argument("--json", action="store_true")
+    p.add_argument("--all", action="store_true", help="include pruned candidates (marked) in the rows")
+    p.set_defaults(fn=cmd_board)
     p = sub.add_parser("impls"); p.add_argument("--axis", default=None); p.set_defaults(fn=cmd_impls)
     p = sub.add_parser("apply"); p.add_argument("--id", required=True)
     p.add_argument("--dry", action="store_true", help="print the genome/diff without applying")

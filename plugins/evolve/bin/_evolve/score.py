@@ -369,7 +369,12 @@ def ingest(root, cfg, *, result_text, meta, mode, split, env=None, genome=None, 
         raise ValueError('--parent "" is empty — pass a real archived id or omit the flag')
     retract = bool(res.get("retract"))
     all_recs = archive.load(root)
-    prior = [r for r in all_recs if r.get("id") == rec["id"]]
+    # Per-id bookkeeping (retraction scope, generation inheritance) reasons over the id's
+    # MEASUREMENT history. Prune/reinstate records are selection-surface bookkeeping that
+    # carry no generation and whose env is a view scope, not a measurement site — folding
+    # them in stamps generation 0 on the next re-ingest and manufactures phantom envs that
+    # make `evolve retract` refuse a single-env id.
+    prior = [r for r in all_recs if r.get("id") == rec["id"] and "prune" not in r]
     env_given = env or res.get("env")
     rec_env = env_given or "external"
     if fitness is not None and not reinstate and split != FINAL_SPLIT:
@@ -384,6 +389,13 @@ def ingest(root, cfg, *, result_text, meta, mode, split, env=None, genome=None, 
                              "selection_env-pinned project also pass --env with the id's own "
                              "partition so the reinstating record lands where selection looks), "
                              "or use `evolve rescore` to replay it under the engine's own eval")
+        pruned_view = archive.pruned_ids(all_recs, cross_partition=True)
+        if rec["id"] in pruned_view:
+            print(f"evolve: note — id {rec['id']!r} is pruned ({pruned_view[rec['id']]}); this "
+                  "score records but does NOT reinstate it into selection. Prune is a redundancy "
+                  "status, not a validity verdict — new data says nothing about redundancy; "
+                  "reinstate deliberately: `evolve prune --id ... --reinstate --reason ...`",
+                  file=sys.stderr)
     if retract:
         if fitness is not None:
             raise ValueError("retract: true must come with fitness null — a retraction invalidates "

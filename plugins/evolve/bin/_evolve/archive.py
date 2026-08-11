@@ -111,6 +111,29 @@ def _safe_id(rec_id):
 
 
 def _check_record(r):
+    if "prune" in r:
+        # Prune/reinstate records are selection-surface bookkeeping, not measurements:
+        # no mode, no split, no fitness — just id + verdict + audit trail (+ env scope).
+        if not isinstance(r.get("prune"), bool):
+            raise ValueError("prune must be true (prune) or false (reinstate) — a truthy "
+                             "non-bool would make the intent ambiguous")
+        if not r.get("id"):
+            raise ValueError("a prune record needs an id")
+        if not r.get("reason"):
+            raise ValueError("a prune record needs a reason (the audit trail for why the "
+                             "candidate left or re-entered selection)")
+        if r.get("fitness") is not None:
+            raise ValueError("a prune record must not carry fitness — prune is a selection-"
+                             "surface status, not a verdict on the score; a new score is a "
+                             "separate record")
+        if r.get("retract"):
+            raise ValueError("a record cannot be both a prune marker and a retraction — the "
+                             "statuses are independent; append two records")
+        mc = r.get("min_carriers")
+        if mc is not None and (not isinstance(mc, int) or isinstance(mc, bool) or mc < 1):
+            raise ValueError("prune min_carriers must be a positive integer — it is the "
+                             "certificate parameter the audit re-checks this prune against")
+        return
     for k in ("id", "mode", "split"):
         if not r.get(k):
             raise ValueError(f"record missing required field {k!r}")
@@ -209,6 +232,49 @@ def retracted_ids(records, selection_env=None, cross_partition=False):
     return {rid: reason[rid] for rid, i in last_retract.items() if i > last_score.get(rid, -1)}
 
 
+def pruned_ids(records, selection_env=None, cross_partition=False):
+    """id -> reason for ids whose LAST prune-shaped record says prune: true — the
+    SELECTION-SURFACE view, distinct from both validity (retracted_ids) and fitness
+    (valid). A prune says the candidate's score stays TRUE but the candidate is a
+    redundant VEHICLE — its traits are carried at-least-as-well by a diverse set of
+    other live candidates (prune.plan computes the evidence) — so it stops being offered
+    to selection: parents, crossover partners, inspirations, the board default. Nothing
+    else changes — dedup, lineage/generation, apply and history are untouched, and a
+    pruned genome resubmitted under a fresh id is still a duplicate.
+
+    Reinstatement is explicit (prune: false) and needs no re-measurement. Unlike
+    retraction, a later score does NOT reinstate: new data says nothing about
+    redundancy, which is a judgment about the POOL, not about the candidate's number.
+    Scope mirrors retracted_ids for the opposite reason retraction earned cross-partition
+    default: the coverage evidence is a fitness comparison and fitness is
+    partition-scoped, so a prune bites in the partition whose pool justified it (its env
+    tag); cross_partition=True is the global view (e.g. a cutover roster deciding what
+    to re-measure)."""
+    env = None if cross_partition else selection_env
+    out = {}
+    for r in records:
+        rid = r.get("id")
+        if rid is None or not isinstance(r.get("prune"), bool):
+            continue
+        if env is not None and r.get("env") != env:
+            continue
+        if r["prune"]:
+            out[rid] = str(r.get("reason") or "pruned")
+        else:
+            out.pop(rid, None)
+    return out
+
+
+def selection_pool(records, selection_env=None):
+    """The records selection actually draws from: one best record per id (fitness view)
+    minus pruned ids (selection-surface view). THE single choke point — parent sampling,
+    the crossover-partner draw, inspirations, the board default and doctor's pressure
+    readout all read this, so a pruned id cannot leak back through one forgotten consumer
+    (design review measured exactly that: the partner draw bypassed the first cut)."""
+    pruned = pruned_ids(records, selection_env)
+    return [r for r in best_per_id(valid(records, selection_env)) if r["id"] not in pruned]
+
+
 def scored_any(records):
     """Every numerically-scored non-final record, INCLUDING retracted ids. The dedup corpus
     uses this instead of valid(): retraction removes an id from selection, not from memory —
@@ -234,8 +300,10 @@ def best_per_id(records):
     return [v[1] for v in by_id.values()]
 
 
-def leaderboard(root, top=10, selection_env=None):
-    items = best_per_id(valid(load(root), selection_env))
+def leaderboard(root, top=10, selection_env=None, include_pruned=False):
+    recs = load(root)
+    items = (best_per_id(valid(recs, selection_env)) if include_pruned
+             else selection_pool(recs, selection_env))
     items.sort(key=lambda r: (r.get("mode") == "full", r["fitness"]), reverse=True)
     return items[:top]
 
@@ -306,11 +374,13 @@ def sample_parent(root, seed=0, lam="auto", selection_env=None, noise_floor=None
     (ShinkaEvolve §3.1 weighted sampling, the paper's largest ablated gain). Seeded and
     deterministic given the archive state and λ. Returns a record or None on an empty archive."""
     all_recs = load(root)
-    items = best_per_id(valid(all_recs, selection_env))
+    items = selection_pool(all_recs, selection_env)
     if not items:
         return None
     # Penalize only offspring in the pool being sampled (same env, non-final), so the diversity
-    # bonus matches the population the board/brief show.
+    # bonus matches the population the board/brief show. Pruned CHILDREN still count against
+    # their parent: the penalty measures how much a lineage has been bred, and pruning a child
+    # doesn't un-breed it.
     offspring = offspring_counts(valid(all_recs, selection_env))
     _, weights = selection_weights(items, lam, offspring, noise_floor)
     return random.Random(f"parent:{seed}").choices(items, weights=weights, k=1)[0]
@@ -320,7 +390,7 @@ def sample_inspirations(root, parent_id, n_top=2, n_archive=2, seed=0, selection
     """Top-K performers + random archive members, excluding the parent — the context that
     makes the archive reach the prompt (AlphaEvolve's 'no context' ablation: an archive
     that never reaches the prompt is dead weight)."""
-    items = [r for r in best_per_id(valid(load(root), selection_env)) if r["id"] != parent_id]
+    items = [r for r in selection_pool(load(root), selection_env) if r["id"] != parent_id]
     items.sort(key=lambda r: (r.get("mode") == "full", r["fitness"]), reverse=True)
     top = items[:n_top]
     rest = [r for r in items[n_top:]]
@@ -377,7 +447,10 @@ def budget_state(root, budget, selection_env=None):
     # Count generations/full_evals over the SAME env-partitioned, non-final population that
     # selection draws from, so a foreign-env record (e.g. an ingest) can't burn this env's
     # budget or trip its staleness gate. load() preserves append order, which decides "since".
-    selectable = [r for r in recs if r.get("id") is not None
+    # Prune/reinstate records are excluded structurally: they carry no generation and no
+    # fitness so they'd be inert anyway, but staleness is a promise ("prune records are
+    # not work"), not an accident of field absence.
+    selectable = [r for r in recs if r.get("id") is not None and "prune" not in r
                   and r.get("split", DEFAULT_SPLIT) != FINAL_SPLIT
                   and (selection_env is None or r.get("env") == selection_env)]
     full_evals = len({r["id"] for r in selectable if r.get("mode") == "full"})
