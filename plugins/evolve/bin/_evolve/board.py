@@ -26,9 +26,10 @@ def _by(records, key):
     return out
 
 
-def report(root, cfg, top=10):
+def report(root, cfg, top=10, include_pruned=False):
     recs = archive.load(root)
     sel_env = cfg["fitness"].get("selection_env")
+    pruned = archive.pruned_ids(recs, sel_env)
     selection = [r for r in recs if r.get("split", DEFAULT_SPLIT) != FINAL_SPLIT]
     final = [r for r in recs if r.get("split") == FINAL_SPLIT]
     envs = archive.selection_envs(recs)
@@ -44,23 +45,38 @@ def report(root, cfg, top=10):
     if len(commits) > 1:
         warnings.append(f"scored candidates span {len(commits)} HEAD commits — the frozen baseline "
                         "shifted mid-campaign; fitnesses from different commits are not comparable")
+    # --all APPENDS every pruned candidate after the top rows: merging them into one
+    # ranking and then slicing [:top] hides exactly the rows --all promises to show
+    # (pruned candidates are dominated by construction, so they never make the cutoff).
+    rows = archive.leaderboard(root, top, sel_env)
+    if include_pruned and pruned:
+        by_id = {r["id"]: r for r in archive.best_per_id(archive.valid(recs, sel_env))}
+        rows += sorted((by_id[i] for i in sorted(pruned) if i in by_id),
+                       key=lambda r: (r.get("mode") == "full", r["fitness"]), reverse=True)
     return {
         "leaderboard": [
             {"id": r["id"], "fitness": r["fitness"], "mode": r.get("mode"),
              "generation": r.get("generation"), "inventor": r.get("inventor"),
-             "operator": r.get("operator"), "env": r.get("env"), "rationale": r.get("rationale")}
-            for r in archive.leaderboard(root, top, sel_env)
+             "operator": r.get("operator"), "env": r.get("env"), "rationale": r.get("rationale"),
+             **({"pruned": True} if r["id"] in pruned else {})}
+            for r in rows
         ],
+        # Pruned = out of selection, NOT out of history: scores stay valid, `evolve apply`
+        # still retrieves, reinstatement needs no re-measurement.
+        "pruned": {"n": len(pruned), "ids": sorted(pruned)[:24]},
         "budget": archive.budget_state(root, cfg["budget"], sel_env),
         "noise_floor": cfg["fitness"].get("noise_floor"),
         "selection_env": sel_env,
         "env_offsets": cfg["fitness"].get("env_offsets") or {},
         "environments": envs,
         "records": {"total": len(recs), "selection_split": len(selection), "final_split": len(final)},
-        # Retraction records are bookkeeping, not runs — counting them as "failed" would skew
-        # the guardrail-failure-rate signal the status skill reads for eval/brief health.
-        "by_inventor": _by([r for r in selection if not r.get("retract")], "inventor"),
-        "by_operator": _by([r for r in selection if not r.get("retract")], "operator"),
+        # Retraction and prune records are bookkeeping, not runs — counting them as "failed"
+        # would skew the guardrail-failure-rate signal the status skill reads for eval/brief
+        # health (and prune records carry no inventor, so they'd all pile under "?").
+        "by_inventor": _by([r for r in selection if not r.get("retract") and "prune" not in r],
+                           "inventor"),
+        "by_operator": _by([r for r in selection if not r.get("retract") and "prune" not in r],
+                           "operator"),
         "final_split_runs": [
             {"id": r.get("id"), "fitness": r.get("fitness"), "mode": r.get("mode"), "env": r.get("env")}
             for r in final
@@ -80,7 +96,12 @@ def render(rep):
         fit = f"{r['fitness']:+.4f}" if isinstance(r["fitness"], (int, float)) else " fail "
         lines.append(f"  {fit}  {r['mode'] or '?':5s}  gen{r['generation'] or 0:<3} "
                      f"{r['id']:26s}  [{r.get('inventor') or '?'}/{r.get('operator') or '?'}]  "
-                     f"{(r.get('rationale') or '')[:48]}")
+                     + ("[PRUNED] " if r.get("pruned") else "")
+                     + f"{(r.get('rationale') or '')[:48]}")
+    if rep.get("pruned", {}).get("n"):
+        lines.append(f"  … pruned: {rep['pruned']['n']} candidate(s) held out of selection "
+                     "(scores stay valid; `evolve board --all` shows them, "
+                     "`evolve prune --id … --reinstate` returns one)")
     b = rep["budget"]
     if b.get("disabled"):
         lines.append(f"\nCOUNTS: gen {b['generations']}, full evals {b['full_evals']} "

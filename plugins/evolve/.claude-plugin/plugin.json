@@ -1,6 +1,6 @@
 {
   "name": "evolve",
-  "description": "ShinkaEvolve-inspired evolutionary search for any project: inventor agents propose candidates over a marked code region or a chunk registry, a deterministic engine owns selection \u2014 append-only archive, median-relative weighted parent sampling, novelty dedup, pristine-clone scoring, budget and holdout firewalls. Search accumulates and never crowns: no champion, no promotion, no adoption step \u2014 validity is enforced per-candidate (guardrails at score time, append-only retraction post hoc), and what ships is decided outside the engine",
-  "version": "0.6.0",
+  "description": "ShinkaEvolve-inspired evolutionary search for any project: inventor agents propose candidates over a marked code region or a chunk registry, a deterministic engine owns selection \u2014 append-only archive, median-relative weighted parent sampling, novelty dedup, pristine-clone scoring, budget and holdout firewalls. Search accumulates and never crowns: no champion, no promotion, no adoption step \u2014 validity is enforced per-candidate (guardrails at score time, append-only retraction post hoc), redundant vehicles leave selection by trait-coverage pruning (traits and trait-pairs must survive elsewhere; scores stay valid), and what ships is decided outside the engine",
+  "version": "0.7.2",
   "repository": "https://github.com/veryfansome/claudemods"
 }

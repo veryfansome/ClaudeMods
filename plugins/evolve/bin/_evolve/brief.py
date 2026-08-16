@@ -170,7 +170,17 @@ def contract_block(root, cfg, axis=None):
 
 def build(root, cfg, *, operator="diff", parent_id=None, axis=None, cross_with=None, seed=0):
     sel_env = cfg["fitness"].get("selection_env")
-    recs = {r["id"]: r for r in archive.best_per_id(archive.valid(archive.load(root), sel_env))}
+    all_recs = archive.load(root)
+    recs = {r["id"]: r for r in archive.best_per_id(archive.valid(all_recs, sel_env))}
+    pruned = archive.pruned_ids(all_recs, sel_env)
+    # Retraction outranks prune: a pruned-then-retracted id falls through to the ordinary
+    # missing/invalid-parent path rather than earning a "score stays valid" message.
+    for role, rid in (("parent", parent_id), ("crossover partner", cross_with)):
+        if rid and rid in pruned and rid in recs:
+            raise ValueError(f"{role} {rid!r} is pruned ({pruned[rid]}) — its score stays valid "
+                             "but the engine no longer offers it to selection. Resample the "
+                             "slot, or reinstate it first (`evolve prune --id ... --reinstate "
+                             "--reason ...`)")
     parent = recs.get(parent_id) if parent_id else None
     sections = [
         f"TASK: {cfg['task']}",

@@ -267,6 +267,16 @@ def rescore(root, cfg, *, rec_id, mode, split=DEFAULT_SPLIT, env=None, no_archiv
     matches = [r for r in archive.load(root) if r.get("id") == rec_id]
     if not matches:
         raise ValueError(f"no archived candidate with id {rec_id!r} to re-score")
+    if not no_archive and split != FINAL_SPLIT:
+        # The reinstate-by-rescore path un-RETRACTS; it never un-prunes. Say so here —
+        # this is the documented recovery flow for a retracted id, and a silent success
+        # reads as "back in selection" when the standing prune still excludes it.
+        pruned_view = archive.pruned_ids(archive.load(root), cross_partition=True)
+        if rec_id in pruned_view:
+            print(f"evolve: note — id {rec_id!r} is pruned ({pruned_view[rec_id]}); this "
+                  "rescore records a fresh score but does NOT reinstate it into selection; "
+                  "reinstate deliberately: `evolve prune --id ... --reinstate --reason ...`",
+                  file=sys.stderr)
     # Prefer the most-recent record that actually carries reproducible CODE — an id can also
     # have an ingested record (score only, no artifact), e.g. after a cross-env ingest, and
     # that one can't be replayed. Fall back to the latest record (handles the empty-patch seed).
@@ -369,7 +379,12 @@ def ingest(root, cfg, *, result_text, meta, mode, split, env=None, genome=None, 
         raise ValueError('--parent "" is empty — pass a real archived id or omit the flag')
     retract = bool(res.get("retract"))
     all_recs = archive.load(root)
-    prior = [r for r in all_recs if r.get("id") == rec["id"]]
+    # Per-id bookkeeping (retraction scope, generation inheritance) reasons over the id's
+    # MEASUREMENT history. Prune/reinstate records are selection-surface bookkeeping that
+    # carry no generation and whose env is a view scope, not a measurement site — folding
+    # them in stamps generation 0 on the next re-ingest and manufactures phantom envs that
+    # make `evolve retract` refuse a single-env id.
+    prior = [r for r in all_recs if r.get("id") == rec["id"] and "prune" not in r]
     env_given = env or res.get("env")
     rec_env = env_given or "external"
     if fitness is not None and not reinstate and split != FINAL_SPLIT:
@@ -384,6 +399,17 @@ def ingest(root, cfg, *, result_text, meta, mode, split, env=None, genome=None, 
                              "selection_env-pinned project also pass --env with the id's own "
                              "partition so the reinstating record lands where selection looks), "
                              "or use `evolve rescore` to replay it under the engine's own eval")
+    # OUTSIDE the not-reinstate gate: an `ingest --reinstate` (un-retracting a pruned id)
+    # is exactly the flow where an operator most plausibly assumes the id returned to
+    # selection — reviewed as the one path where silence was measured misleading.
+    if fitness is not None and split != FINAL_SPLIT:
+        pruned_view = archive.pruned_ids(all_recs, cross_partition=True)
+        if rec["id"] in pruned_view:
+            print(f"evolve: note — id {rec['id']!r} is pruned ({pruned_view[rec['id']]}); this "
+                  "score records but does NOT reinstate it into selection. Prune is a redundancy "
+                  "status, not a validity verdict — new data says nothing about redundancy; "
+                  "reinstate deliberately: `evolve prune --id ... --reinstate --reason ...`",
+                  file=sys.stderr)
     if retract:
         if fitness is not None:
             raise ValueError("retract: true must come with fitness null — a retraction invalidates "

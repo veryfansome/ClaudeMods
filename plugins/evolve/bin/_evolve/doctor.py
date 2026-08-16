@@ -14,7 +14,7 @@ import json
 import pathlib
 import subprocess
 
-from . import archive, config as cfgmod, runner, score, surface
+from . import archive, config as cfgmod, prune, runner, score, surface
 from .score import default_env
 
 
@@ -149,13 +149,13 @@ def run(root, run_eval=False, measure_noise=False, dry=False, force=False):
 
     retired = surface.retired_impls(root)
     if retired:
-        live = [r["id"] for r in archive.best_per_id(archive.valid(all_recs, sel_env))
+        live = [r["id"] for r in archive.selection_pool(all_recs, sel_env)
                 if surface.genome_selects_retired(r.get("genome") or {}, retired)]
         if live:
             warnings.append(f"{len(live)} live selectable candidate(s) select retired impls "
                             f"({live[:5]}) — a retired mechanism stays reachable as a PARENT "
-                            "until its carriers are retracted (`evolve retract`) or the impl "
-                            "is un-retired")
+                            "until its carriers are retracted (`evolve retract`), pruned "
+                            "(`evolve prune`) or the impl is un-retired")
 
     # Pre-record-scoped-retraction archives: an id whose latest non-final record is a plain
     # failure AFTER a scored one used to mean "retracted" (latest-verdict-wins). That gesture is
@@ -178,12 +178,52 @@ def run(root, run_eval=False, measure_noise=False, dry=False, force=False):
                         'pre-upgrade revocation, re-ingest {"retract": true, "fitness": null, '
                         '"guardrail": "<reason>"}; if it was a routine flake, rescore or ignore')
 
+    # Standing prunes: re-derive every coverage certificate against the CURRENT pool. The
+    # certificate is a pure function of the archive, and its inputs are mutable — a
+    # retraction wave or a re-score can thin a pruned candidate's carriers after the fact
+    # (replayed from the field: one wave would have silently voided 9 prunes, one trait to
+    # zero carriers). Doctor never nags you TO prune and never reinstates; it checks that
+    # what WAS pruned still keeps its promise.
+    pruned_view = archive.pruned_ids(all_recs, sel_env)
+    if pruned_view:
+        aud = prune.audit(all_recs, cfg)
+        # THINNED coverage is the owner's judgment (warn); a LOST trait/pair — zero
+        # surviving carriers at any fitness — breaks the "never traits" invariant itself
+        # and FAILS the check. Killing a mechanism on purpose is retirement's job.
+        lost = [v for v in aud["voided"] if v.get("trait_lost")]
+        _check(checks, "prune_coverage", not lost,
+               f"{aud['pruned']} pruned; {len(aud['voided'])} certificate(s) no longer hold "
+               f"({len(lost)} with a trait/pair LOST from the pool); "
+               f"{len(aud['unauditable'])} unauditable (explicit prunes without genomes)")
+        for v in aud["voided"]:
+            warnings.append(f"prune of {v['id']} no longer holds — {v['why']}; a later "
+                            "retraction/re-score/prune thinned its carriers. Reinstate it "
+                            "(`evolve prune --id ... --reinstate --reason ...`) or accept "
+                            "the thinner coverage deliberately"
+                            + ("" if not v.get("trait_lost") else
+                               " — this one LOST a trait/pair from the pool entirely; if "
+                               "the mechanism itself should die, that is retirement "
+                               "(evolve/retired_impls.json), not prune"))
+    # Standing prunes scoped to ANOTHER partition whose ids are nonetheless live here: they
+    # do not bite this pool (prune records are per-partition streams), which is surprising
+    # exactly when the id is selectable. Old-partition prunes for ids with no valid record
+    # here are the normal post-cutover state and stay silent.
+    if sel_env is not None:
+        cross = archive.pruned_ids(all_recs, sel_env, cross_partition=True)
+        live_here = {r["id"] for r in archive.selection_pool(all_recs, sel_env)}
+        strays = sorted((set(cross) - set(pruned_view)) & live_here)
+        if strays:
+            warnings.append(f"{len(strays)} candidate(s) carry a standing prune in ANOTHER "
+                            f"partition but are live in {sel_env!r} ({strays[:5]}) — a prune "
+                            "bites only the partition whose pool justified it; re-plan and "
+                            "prune here too if they are redundant in this pool")
+
     # Realized parent-selection pressure. λ is in units of 1/fitness, so a mis-scaled explicit
     # value silently degrades sampling to uniform while everything else looks healthy — a
     # field campaign ran 8 rounds of statistically-uniform parent picks before measuring it.
-    # This prints the numbers sampling actually uses (same helper), fitness pressure only, so
-    # the offspring penalty can't mask an inert λ.
-    per_id = archive.best_per_id(archive.valid(all_recs, sel_env))
+    # This prints the numbers sampling actually uses (same helper + same pruned-excluding
+    # pool), fitness pressure only, so the offspring penalty can't mask an inert λ.
+    per_id = archive.selection_pool(all_recs, sel_env)
     if len(per_id) >= 2:
         lam_cfg = cfg["search"].get("lambda", "auto")
         lam, fit_w = archive.selection_weights(per_id, lam_cfg, {}, noise_floor=floor)
