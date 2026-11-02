@@ -30,12 +30,15 @@ def main():
     target = (payload.get("tool_input") or {}).get("file_path") or ""
     if not target:
         return 0
-    root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    root = pathlib.Path(root)
+    cwd = pathlib.Path(payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    path = pathlib.Path(target)
+    path = (path if path.is_absolute() else cwd / path).resolve()
 
-    # Walk up to the enclosing repo/config — the edit may run from a subdir or worktree.
-    cfg_path = None
-    for base in [root, *root.parents]:
+    # Walk up from the edited file to the nearest enclosing project (evolve/evolve.json): the
+    # project may be a subdirectory of the session's folder (one search per subproject, several
+    # per repo), and the session may run from a subdir or worktree of it.
+    cfg_path, root = None, None
+    for base in path.parents:
         c = base / "evolve" / "evolve.json"
         if c.exists():
             cfg_path, root = c, base
@@ -55,7 +58,7 @@ def main():
         return 0
 
     try:
-        rel = str(pathlib.Path(target).resolve().relative_to(root.resolve()))
+        rel = str(path.relative_to(root.resolve()))
     except ValueError:
         return 0  # outside this project entirely
 

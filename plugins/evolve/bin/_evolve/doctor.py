@@ -46,7 +46,7 @@ def run(root, run_eval=False, measure_noise=False, dry=False, force=False):
     # it is legitimately dirty after every score — warning about it would be permanent noise.
     # Surface source and the (project-side) eval adapter live outside evolve/, and those ARE
     # what "invisible to scoring" is about.
-    tracked_mods = [p for p in subprocess.run(["git", "diff", "--name-only", "HEAD"], cwd=root,
+    tracked_mods = [p for p in subprocess.run(["git", "diff", "--name-only", "--relative", "HEAD"], cwd=root,
                                               capture_output=True, text=True).stdout.split()
                     if not (p == cfgmod.STATE_DIR or p.startswith(cfgmod.STATE_DIR + "/"))]
     if tracked_mods:

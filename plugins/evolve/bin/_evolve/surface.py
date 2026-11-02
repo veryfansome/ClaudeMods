@@ -87,9 +87,12 @@ def _matches_any(path, globs):
 
 
 def changed_files(worktree, diff_filter=None):
-    """Tracked paths changed vs HEAD in a candidate worktree. diff_filter narrows to git
-    status letters (e.g. 'MD' = modified/deleted only, excluding staged additions)."""
-    args = ["diff", "--name-only"]
+    """Tracked paths changed vs HEAD in a candidate worktree, relative to it: the project root
+    can be a subdirectory of the repo (one search per subproject, several per repo), and the
+    surface, registry and protected globs are all root-relative. Changes outside the root are
+    not this project's and are left out. diff_filter narrows to git status letters (e.g.
+    'MD' = modified/deleted only, excluding staged additions)."""
+    args = ["diff", "--name-only", "--relative"]
     if diff_filter:
         args.append(f"--diff-filter={diff_filter}")
     out = _git([*args, "HEAD"], worktree)
@@ -125,7 +128,7 @@ def guard_markers(worktree, cfg):
         except (UnicodeDecodeError, OSError) as e:
             violations.append(f"{path}: surface file is unreadable as text ({e})")
             continue
-        base = _git(["show", f"HEAD:{path}"], worktree)
+        base = _git(["show", f"HEAD:./{path}"], worktree)  # ./: from the project root, which may be a subdirectory
         try:
             base_frozen, _ = split_regions(base, f"HEAD:{path}")
             cand_frozen, _ = split_regions(cand, path)
@@ -149,7 +152,8 @@ def guard_markers(worktree, cfg):
 
 
 def extract_patch(worktree):
-    return _git(["diff", "--binary", "HEAD"], worktree)
+    # --relative: paths relative to the project root, as the scoring export (of that root) has them.
+    return _git(["diff", "--binary", "--relative", "HEAD"], worktree)
 
 
 def candidate_mutable_text(worktree, cfg):
