@@ -98,8 +98,12 @@ def git_worktree(root):
     if r.returncode != 0:
         shutil.rmtree(tmp, ignore_errors=True)
         raise InfraError(f"could not create git worktree: {r.stderr.strip()}")
+    # A worktree checks out the whole repo; a project rooted in a subdirectory works in its
+    # copy of that subdirectory (git rev-parse --show-prefix: '' at the top level).
+    prefix = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=root,
+                            capture_output=True, text=True).stdout.strip()
     try:
-        yield target
+        yield target / prefix if prefix else target
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(target)],
                        cwd=root, capture_output=True)
@@ -138,9 +142,13 @@ def apply_patch(clone, patch_text):
         return  # empty candidate = the seed program itself
     pf = clone / ".evolve-candidate.patch"
     pf.write_text(patch_text)
-    # git apply works outside a repo (the export has no .git), applying to plain files.
-    r = subprocess.run(["git", "apply", "--whitespace=nowarn", str(pf.name)],
-                       cwd=clone, capture_output=True, text=True)
+    # git apply works outside a repo (the export has no .git), applying to plain files. Inside a
+    # repo (a git_worktree of a project rooted in a subdirectory) it reads paths from the repo's
+    # top level and skips any outside the current directory, so the project's prefix goes first.
+    prefix = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=clone,
+                            capture_output=True, text=True).stdout.strip()
+    args = ["git", "apply", "--whitespace=nowarn"] + ([f"--directory={prefix}"] if prefix else [])
+    r = subprocess.run([*args, str(pf.name)], cwd=clone, capture_output=True, text=True)
     pf.unlink(missing_ok=True)
     if r.returncode != 0:
         raise EvalFailure(f"patch does not apply to HEAD: {_tail(r.stderr)}")
